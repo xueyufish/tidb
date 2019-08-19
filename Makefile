@@ -16,7 +16,7 @@ GOBUILD   := CGO_ENABLED=1 $(GO) build $(BUILD_FLAG) -tags codes
 GOTEST    := CGO_ENABLED=1 $(GO) test -p 4
 OVERALLS  := CGO_ENABLED=1 GO111MODULE=on overalls
 
-ARCH      := "`uname -s`"
+ARCH      := "`uname -s`"`
 LINUX     := "Linux"
 MAC       := "Darwin"
 PACKAGE_LIST  := go list ./...| grep -vE "cmd" | grep -vE "test"

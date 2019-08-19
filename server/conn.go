@@ -299,7 +299,7 @@ type handshakeResponse41 struct {
 // parseOldHandshakeResponseHeader parses the old version handshake header HandshakeResponse320
 func parseOldHandshakeResponseHeader(ctx context.Context, packet *handshakeResponse41, data []byte) (parsedBytes int, err error) {
 	// Ensure there are enough data to read:
-	// https://dev.mysql.com/doc/internals/en/connection-phase-packets.html#packet-Protocol::HandshakeResponse320
+	// https://dev.mysql.com/doc/internals/en/connection-phase-packets.html#packet-Protocol::HandshakeResponse320j
 	logutil.Logger(ctx).Debug("try to parse hanshake response as Protocol::HandshakeResponse320", zap.ByteString("packetData", data))
 	if len(data) < 2+3 {
 		logutil.Logger(ctx).Error("got malformed handshake response", zap.ByteString("packetData", data))
