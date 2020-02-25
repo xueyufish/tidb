@@ -24,6 +24,7 @@ import (
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/parser/terror"
 	pumpcli "github.com/pingcap/tidb-tools/tidb-binlog/pump_client"
 	"github.com/pingcap/tidb/ddl"
@@ -35,6 +36,7 @@ import (
 	"github.com/pingcap/tidb/store/mockstore"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/codec"
+	"github.com/pingcap/tidb/util/collate"
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/testkit"
 	binlog "github.com/pingcap/tipb/go-binlog"
@@ -152,8 +154,8 @@ func (s *testBinlogSuite) TestBinlog(c *C) {
 	c.Assert(prewriteVal.SchemaVersion, Greater, int64(0))
 	c.Assert(prewriteVal.Mutations[0].TableId, Greater, int64(0))
 	expected := [][]types.Datum{
-		{types.NewIntDatum(1), types.NewStringDatum("abc")},
-		{types.NewIntDatum(2), types.NewStringDatum("cde")},
+		{types.NewIntDatum(1), types.NewCollationStringDatum("abc", mysql.DefaultCollationName, collate.DefaultLen)},
+		{types.NewIntDatum(2), types.NewCollationStringDatum("cde", mysql.DefaultCollationName, collate.DefaultLen)},
 	}
 	gotRows := mutationRowsToRows(c, prewriteVal.Mutations[0].InsertedRows, 2, 4)
 	c.Assert(gotRows, DeepEquals, expected)
@@ -161,10 +163,10 @@ func (s *testBinlogSuite) TestBinlog(c *C) {
 	tk.MustExec("update local_binlog set name = 'xyz' where id = 2")
 	prewriteVal = getLatestBinlogPrewriteValue(c, pump)
 	oldRow := [][]types.Datum{
-		{types.NewIntDatum(2), types.NewStringDatum("cde")},
+		{types.NewIntDatum(2), types.NewCollationStringDatum("cde", mysql.DefaultCollationName, collate.DefaultLen)},
 	}
 	newRow := [][]types.Datum{
-		{types.NewIntDatum(2), types.NewStringDatum("xyz")},
+		{types.NewIntDatum(2), types.NewCollationStringDatum("xyz", mysql.DefaultCollationName, collate.DefaultLen)},
 	}
 	gotRows = mutationRowsToRows(c, prewriteVal.Mutations[0].UpdatedRows, 1, 3)
 	c.Assert(gotRows, DeepEquals, oldRow)
@@ -176,7 +178,7 @@ func (s *testBinlogSuite) TestBinlog(c *C) {
 	prewriteVal = getLatestBinlogPrewriteValue(c, pump)
 	gotRows = mutationRowsToRows(c, prewriteVal.Mutations[0].DeletedRows, 1, 3)
 	expected = [][]types.Datum{
-		{types.NewIntDatum(1), types.NewStringDatum("abc")},
+		{types.NewIntDatum(1), types.NewCollationStringDatum("abc", mysql.DefaultCollationName, collate.DefaultLen)},
 	}
 	c.Assert(gotRows, DeepEquals, expected)
 
@@ -270,7 +272,8 @@ func (s *testBinlogSuite) TestMaxRecvSize(c *C) {
 		},
 		Client: s.client,
 	}
-	err := info.WriteBinlog(1)
+	binlogWR := info.WriteBinlog(1)
+	err := binlogWR.GetError()
 	c.Assert(err, NotNil)
 	c.Assert(terror.ErrCritical.Equal(err), IsFalse, Commentf("%v", err))
 }
@@ -358,7 +361,7 @@ func mutationRowsToRows(c *C, mutationRows [][]byte, columnValueOffsets ...int) 
 		c.Assert(err, IsNil)
 		for i := range datums {
 			if datums[i].Kind() == types.KindBytes {
-				datums[i].SetBytesAsString(datums[i].GetBytes())
+				datums[i].SetBytesAsString(datums[i].GetBytes(), mysql.DefaultCollationName, collate.DefaultLen)
 			}
 		}
 		row := make([]types.Datum, 0, len(columnValueOffsets))
@@ -430,4 +433,53 @@ func (s *testBinlogSuite) TestDeleteSchema(c *C) {
 	// The final schema of this SQL should be the schema of table b1, rather than the schema of join result.
 	tk.MustExec("delete from b1 where job_id in (select job_id from b2 where batch_class = 'TEST') or split_job_id in (select job_id from b2 where batch_class = 'TEST');")
 	tk.MustExec("delete b1 from b2 right join b1 on b1.job_id = b2.job_id and batch_class = 'TEST';")
+}
+
+func (s *testBinlogSuite) TestAddSpecialComment(c *C) {
+	testCase := []struct {
+		input  string
+		result string
+	}{
+		{
+			"create table t1 (id int ) shard_row_id_bits=2;",
+			"create table t1 (id int ) /*!90000 shard_row_id_bits=2 */ ;",
+		},
+		{
+			"create table t1 (id int ) shard_row_id_bits=2 pre_split_regions=2;",
+			"create table t1 (id int ) /*!90000 shard_row_id_bits=2 pre_split_regions=2 */ ;",
+		},
+		{
+			"create table t1 (id int ) shard_row_id_bits=2     pre_split_regions=2;",
+			"create table t1 (id int ) /*!90000 shard_row_id_bits=2     pre_split_regions=2 */ ;",
+		},
+
+		{
+			"create table t1 (id int ) shard_row_id_bits=2 engine=innodb pre_split_regions=2;",
+			"create table t1 (id int ) /*!90000 shard_row_id_bits=2 pre_split_regions=2 */ engine=innodb ;",
+		},
+		{
+			"create table t1 (id int ) pre_split_regions=2 shard_row_id_bits=2;",
+			"create table t1 (id int ) /*!90000 shard_row_id_bits=2 pre_split_regions=2 */ ;",
+		},
+		{
+			"create table t6 (id int ) shard_row_id_bits=2 shard_row_id_bits=3 pre_split_regions=2;",
+			"create table t6 (id int ) /*!90000 shard_row_id_bits=2 shard_row_id_bits=3 pre_split_regions=2 */ ;",
+		},
+		{
+			"create table t1 (id int primary key auto_random(2));",
+			"create table t1 (id int primary key /*T!40000 auto_random(2) */ );",
+		},
+		{
+			"create table t1 (id int auto_random ( 4 ) primary key);",
+			"create table t1 (id int /*T!40000 auto_random ( 4 ) */ primary key);",
+		},
+		{
+			"create table t1 (id int  auto_random  (   4    ) primary key);",
+			"create table t1 (id int  /*T!40000 auto_random  (   4    ) */ primary key);",
+		},
+	}
+	for _, ca := range testCase {
+		re := binloginfo.AddSpecialComment(ca.input)
+		c.Assert(re, Equals, ca.result)
+	}
 }

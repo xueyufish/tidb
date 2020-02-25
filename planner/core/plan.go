@@ -18,11 +18,11 @@ import (
 	"math"
 	"strconv"
 
-	"github.com/pingcap/errors"
-	"github.com/pingcap/parser/ast"
+	"github.com/cznic/mathutil"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/planner/property"
 	"github.com/pingcap/tidb/sessionctx"
+	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/stringutil"
 	"github.com/pingcap/tipb/go-tipb"
 )
@@ -33,10 +33,19 @@ import (
 type Plan interface {
 	// Get the schema.
 	Schema() *expression.Schema
+
 	// Get the ID.
 	ID() int
+
+	// TP get the plan type.
+	TP() string
+
 	// Get the ID in explain statement
 	ExplainID() fmt.Stringer
+
+	// ExplainInfo returns operator information to be explained.
+	ExplainInfo() string
+
 	// replaceExprColumns replace all the column reference in the plan's expression node.
 	replaceExprColumns(replace map[string]*expression.Column)
 
@@ -44,6 +53,14 @@ type Plan interface {
 
 	// property.StatsInfo will return the property.StatsInfo for this plan.
 	statsInfo() *property.StatsInfo
+
+	// OutputNames returns the outputting names of each column.
+	OutputNames() types.NameSlice
+
+	// SetOutputNames sets the outputting name by the given slice.
+	SetOutputNames(names types.NameSlice)
+
+	SelectBlockOffset() int
 }
 
 func enforceProperty(p *property.PhysicalProperty, tsk task, ctx sessionctx.Context) task {
@@ -52,17 +69,77 @@ func enforceProperty(p *property.PhysicalProperty, tsk task, ctx sessionctx.Cont
 	}
 	tsk = finishCopTask(ctx, tsk)
 	sortReqProp := &property.PhysicalProperty{TaskTp: property.RootTaskType, Items: p.Items, ExpectedCnt: math.MaxFloat64}
-	sort := PhysicalSort{ByItems: make([]*ByItems, 0, len(p.Items))}.Init(ctx, tsk.plan().statsInfo(), sortReqProp)
+	sort := PhysicalSort{ByItems: make([]*ByItems, 0, len(p.Items))}.Init(ctx, tsk.plan().statsInfo(), tsk.plan().SelectBlockOffset(), sortReqProp)
 	for _, col := range p.Items {
 		sort.ByItems = append(sort.ByItems, &ByItems{col.Col, col.Desc})
 	}
 	return sort.attach2Task(tsk)
 }
 
+// optimizeByShuffle insert `PhysicalShuffle` to optimize performance by running in a parallel manner.
+func optimizeByShuffle(pp PhysicalPlan, tsk task, ctx sessionctx.Context) task {
+	if tsk.plan() == nil {
+		return tsk
+	}
+
+	// Don't use `tsk.plan()` here, which will probably be different from `pp`.
+	// Eg., when `pp` is `NominalSort`, `tsk.plan()` would be its child.
+	switch p := pp.(type) {
+	case *PhysicalWindow:
+		if shuffle := optimizeByShuffle4Window(p, ctx); shuffle != nil {
+			return shuffle.attach2Task(tsk)
+		}
+	}
+	return tsk
+}
+
+func optimizeByShuffle4Window(pp *PhysicalWindow, ctx sessionctx.Context) *PhysicalShuffle {
+	concurrency := ctx.GetSessionVars().WindowConcurrency
+	if concurrency <= 1 {
+		return nil
+	}
+
+	sort, ok := pp.Children()[0].(*PhysicalSort)
+	if !ok {
+		// Multi-thread executing on SORTED data source is not effective enough by current implementation.
+		// TODO: Implement a better one.
+		return nil
+	}
+	tail, dataSource := sort, sort.Children()[0]
+
+	partitionBy := make([]*expression.Column, 0, len(pp.PartitionBy))
+	for _, item := range pp.PartitionBy {
+		partitionBy = append(partitionBy, item.Col)
+	}
+	NDV := int(getCardinality(partitionBy, dataSource.Schema(), dataSource.statsInfo()))
+	if NDV <= 1 {
+		return nil
+	}
+	concurrency = mathutil.Min(concurrency, NDV)
+
+	byItems := make([]expression.Expression, 0, len(pp.PartitionBy))
+	for _, item := range pp.PartitionBy {
+		byItems = append(byItems, item.Col)
+	}
+	reqProp := &property.PhysicalProperty{ExpectedCnt: math.MaxFloat64}
+	shuffle := PhysicalShuffle{
+		Concurrency:  concurrency,
+		Tail:         tail,
+		DataSource:   dataSource,
+		SplitterType: PartitionHashSplitterType,
+		HashByItems:  byItems,
+	}.Init(ctx, pp.statsInfo(), pp.SelectBlockOffset(), reqProp)
+	return shuffle
+}
+
 // LogicalPlan is a tree of logical operators.
 // We can do a lot of logical optimizations to it, like predicate pushdown and column pruning.
 type LogicalPlan interface {
 	Plan
+
+	// HashCode encodes a LogicalPlan to fast compare whether a LogicalPlan equals to another.
+	// We use a strict encode method here which ensures there is no conflict.
+	HashCode() []byte
 
 	// PredicatePushDown pushes down the predicates in the where/on/having clauses as deeply as possible.
 	// It will accept a predicate that is an expression slice, and return the expressions that can't be pushed.
@@ -78,8 +155,11 @@ type LogicalPlan interface {
 	// with the lowest cost.
 	findBestTask(prop *property.PhysicalProperty) (task, error)
 
-	// buildKeyInfo will collect the information of unique keys into schema.
-	buildKeyInfo()
+	// BuildKeyInfo will collect the information of unique keys into schema.
+	// Because this method is also used in cascades planner, we cannot use
+	// things like `p.schema` or `p.children` inside it. We should use the `selfSchema`
+	// and `childSchema` instead.
+	BuildKeyInfo(selfSchema *expression.Schema, childSchema []*expression.Schema)
 
 	// pushDownTopN will push down the topN or limit operator during logical optimization.
 	pushDownTopN(topN *LogicalTopN) LogicalPlan
@@ -88,13 +168,13 @@ type LogicalPlan interface {
 	recursiveDeriveStats() (*property.StatsInfo, error)
 
 	// DeriveStats derives statistic info for current plan node given child stats.
-	DeriveStats(childStats []*property.StatsInfo) (*property.StatsInfo, error)
+	// We need selfSchema, childSchema here because it makes this method can be used in
+	// cascades planner, where LogicalPlan might not record its children or schema.
+	DeriveStats(childStats []*property.StatsInfo, selfSchema *expression.Schema, childSchema []*expression.Schema) (*property.StatsInfo, error)
 
-	// preparePossibleProperties is only used for join and aggregation. Like group by a,b,c, all permutation of (a,b,c) is
+	// PreparePossibleProperties is only used for join and aggregation. Like group by a,b,c, all permutation of (a,b,c) is
 	// valid, but the ordered indices in leaf plan is limited. So we can get all possible order properties by a pre-walking.
-	// Please make sure that children's method is called though we may not need its return value,
-	// so we can prepare possible properties for every LogicalPlan node.
-	preparePossibleProperties() [][]*expression.Column
+	PreparePossibleProperties(schema *expression.Schema, childrenProperties ...[][]*expression.Column) [][]*expression.Column
 
 	// exhaustPhysicalPlans generates all possible plans that can match the required property.
 	exhaustPhysicalPlans(*property.PhysicalProperty) []PhysicalPlan
@@ -103,10 +183,6 @@ type LogicalPlan interface {
 
 	// MaxOneRow means whether this operator only returns max one row.
 	MaxOneRow() bool
-
-	// findColumn finds the column in basePlan's schema.
-	// If the column is not in the schema, returns an error.
-	findColumn(*ast.ColumnName) (*expression.Column, int, error)
 
 	// Get all the children.
 	Children() []LogicalPlan
@@ -129,9 +205,6 @@ type PhysicalPlan interface {
 	// ToPB converts physical plan to tipb executor.
 	ToPB(ctx sessionctx.Context) (*tipb.Executor, error)
 
-	// ExplainInfo returns operator information to be explained.
-	ExplainInfo() string
-
 	// getChildReqProps gets the required property by child index.
 	GetChildReqProps(idx int) *property.PhysicalProperty
 
@@ -149,6 +222,12 @@ type PhysicalPlan interface {
 
 	// ResolveIndices resolves the indices for columns. After doing this, the columns can evaluate the rows by their indices.
 	ResolveIndices() error
+
+	// Stats returns the StatsInfo of the plan.
+	Stats() *property.StatsInfo
+
+	// ExplainNormalizedInfo returns operator normalized information for generating digest.
+	ExplainNormalizedInfo() string
 }
 
 type baseLogicalPlan struct {
@@ -164,6 +243,11 @@ func (p *baseLogicalPlan) MaxOneRow() bool {
 	return p.maxOneRow
 }
 
+// ExplainInfo implements Plan interface.
+func (p *baseLogicalPlan) ExplainInfo() string {
+	return ""
+}
+
 type basePhysicalPlan struct {
 	basePlan
 
@@ -172,13 +256,18 @@ type basePhysicalPlan struct {
 	children         []PhysicalPlan
 }
 
-func (p *basePhysicalPlan) GetChildReqProps(idx int) *property.PhysicalProperty {
-	return p.childrenReqProps[idx]
-}
-
-// ExplainInfo implements PhysicalPlan interface.
+// ExplainInfo implements Plan interface.
 func (p *basePhysicalPlan) ExplainInfo() string {
 	return ""
+}
+
+// ExplainInfo implements Plan interface.
+func (p *basePhysicalPlan) ExplainNormalizedInfo() string {
+	return ""
+}
+
+func (p *basePhysicalPlan) GetChildReqProps(idx int) *property.PhysicalProperty {
+	return p.childrenReqProps[idx]
 }
 
 func (p *baseLogicalPlan) getTask(prop *property.PhysicalProperty) task {
@@ -191,39 +280,68 @@ func (p *baseLogicalPlan) storeTask(prop *property.PhysicalProperty, task task) 
 	p.taskMap[string(key)] = task
 }
 
-func (p *baseLogicalPlan) buildKeyInfo() {
-	for _, child := range p.children {
-		child.buildKeyInfo()
+// HasMaxOneRow returns if the LogicalPlan will output at most one row.
+func HasMaxOneRow(p LogicalPlan, childMaxOneRow []bool) bool {
+	if len(childMaxOneRow) == 0 {
+		// The reason why we use this check is that, this function
+		// is used both in planner/core and planner/cascades.
+		// In cascades planner, LogicalPlan may have no `children`.
+		return false
 	}
-	switch p.self.(type) {
-	case *LogicalLock, *LogicalLimit, *LogicalSort, *LogicalSelection, *LogicalApply, *LogicalProjection:
-		p.maxOneRow = p.children[0].MaxOneRow()
+	switch x := p.(type) {
+	case *LogicalLock, *LogicalLimit, *LogicalSort, *LogicalSelection,
+		*LogicalApply, *LogicalProjection, *LogicalWindow, *LogicalAggregation:
+		return childMaxOneRow[0]
 	case *LogicalMaxOneRow:
-		p.maxOneRow = true
+		return true
+	case *LogicalJoin:
+		switch x.JoinType {
+		case SemiJoin, AntiSemiJoin, LeftOuterSemiJoin, AntiLeftOuterSemiJoin:
+			return childMaxOneRow[0]
+		default:
+			return childMaxOneRow[0] && childMaxOneRow[1]
+		}
 	}
+	return false
 }
 
-func newBasePlan(ctx sessionctx.Context, tp string) basePlan {
+// BuildKeyInfo implements LogicalPlan BuildKeyInfo interface.
+func (p *baseLogicalPlan) BuildKeyInfo(selfSchema *expression.Schema, childSchema []*expression.Schema) {
+	childMaxOneRow := make([]bool, len(p.children))
+	for i := range p.children {
+		childMaxOneRow[i] = p.children[i].MaxOneRow()
+	}
+	p.maxOneRow = HasMaxOneRow(p.self, childMaxOneRow)
+}
+
+// BuildKeyInfo implements LogicalPlan BuildKeyInfo interface.
+func (p *logicalSchemaProducer) BuildKeyInfo(selfSchema *expression.Schema, childSchema []*expression.Schema) {
+	selfSchema.Keys = nil
+	p.baseLogicalPlan.BuildKeyInfo(selfSchema, childSchema)
+}
+
+func newBasePlan(ctx sessionctx.Context, tp string, offset int) basePlan {
 	ctx.GetSessionVars().PlanID++
 	id := ctx.GetSessionVars().PlanID
 	return basePlan{
-		tp:  tp,
-		id:  id,
-		ctx: ctx,
+		tp:          tp,
+		id:          id,
+		ctx:         ctx,
+		blockOffset: offset,
 	}
 }
 
-func newBaseLogicalPlan(ctx sessionctx.Context, tp string, self LogicalPlan) baseLogicalPlan {
+func newBaseLogicalPlan(ctx sessionctx.Context, tp string, self LogicalPlan, offset int) baseLogicalPlan {
 	return baseLogicalPlan{
 		taskMap:  make(map[string]task),
-		basePlan: newBasePlan(ctx, tp),
+		basePlan: newBasePlan(ctx, tp, offset),
 		self:     self,
 	}
 }
 
-func newBasePhysicalPlan(ctx sessionctx.Context, tp string, self PhysicalPlan) basePhysicalPlan {
+func newBasePhysicalPlan(ctx sessionctx.Context, tp string, self PhysicalPlan, offset int) basePhysicalPlan {
 	return basePhysicalPlan{
-		basePlan: newBasePlan(ctx, tp),
+		basePlan: newBasePlan(ctx, tp, offset),
 		self:     self,
 	}
 }
@@ -247,10 +365,19 @@ func (p *baseLogicalPlan) PruneColumns(parentUsedCols []*expression.Column) erro
 // basePlan implements base Plan interface.
 // Should be used as embedded struct in Plan implementations.
 type basePlan struct {
-	tp    string
-	id    int
-	ctx   sessionctx.Context
-	stats *property.StatsInfo
+	tp          string
+	id          int
+	ctx         sessionctx.Context
+	stats       *property.StatsInfo
+	blockOffset int
+}
+
+// OutputNames returns the outputting names of each column.
+func (p *basePlan) OutputNames() types.NameSlice {
+	return nil
+}
+
+func (p *basePlan) SetOutputNames(names types.NameSlice) {
 }
 
 func (p *basePlan) replaceExprColumns(replace map[string]*expression.Column) {
@@ -266,15 +393,42 @@ func (p *basePlan) statsInfo() *property.StatsInfo {
 	return p.stats
 }
 
+// ExplainInfo implements Plan interface.
+func (p *basePlan) ExplainInfo() string {
+	return "N/A"
+}
+
 func (p *basePlan) ExplainID() fmt.Stringer {
 	return stringutil.MemoizeStr(func() string {
 		return p.tp + "_" + strconv.Itoa(p.id)
 	})
 }
 
+// TP implements Plan interface.
+func (p *basePlan) TP() string {
+	return p.tp
+}
+
+func (p *basePlan) SelectBlockOffset() int {
+	return p.blockOffset
+}
+
+// Stats implements Plan Stats interface.
+func (p *basePlan) Stats() *property.StatsInfo {
+	return p.stats
+}
+
 // Schema implements Plan Schema interface.
 func (p *baseLogicalPlan) Schema() *expression.Schema {
 	return p.children[0].Schema()
+}
+
+func (p *baseLogicalPlan) OutputNames() types.NameSlice {
+	return p.children[0].OutputNames()
+}
+
+func (p *baseLogicalPlan) SetOutputNames(names types.NameSlice) {
+	p.children[0].SetOutputNames(names)
 }
 
 // Schema implements Plan Schema interface.
@@ -315,12 +469,4 @@ func (p *basePhysicalPlan) SetChild(i int, child PhysicalPlan) {
 // Context implements Plan Context interface.
 func (p *basePlan) SCtx() sessionctx.Context {
 	return p.ctx
-}
-
-func (p *baseLogicalPlan) findColumn(column *ast.ColumnName) (*expression.Column, int, error) {
-	col, idx, err := p.self.Schema().FindColumnAndIndex(column)
-	if err == nil && col == nil {
-		err = errors.Errorf("column %s not found", column.Name.O)
-	}
-	return col, idx, err
 }

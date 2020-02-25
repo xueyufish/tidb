@@ -34,6 +34,7 @@ import (
 	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/distsql"
 	"github.com/pingcap/tidb/domain"
+	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/metrics"
 	"github.com/pingcap/tidb/sessionctx"
@@ -125,7 +126,7 @@ func (e *AnalyzeExec) Next(ctx context.Context, req *chunk.Chunk) error {
 	if err != nil {
 		return err
 	}
-	return statsHandle.Update(GetInfoSchema(e.ctx))
+	return statsHandle.Update(infoschema.GetInfoSchema(e.ctx))
 }
 
 func getBuildStatsConcurrency(ctx sessionctx.Context) (int, error) {
@@ -259,6 +260,7 @@ func (e *AnalyzeIndexExec) fetchAnalyzeResult(ranges []*ranger.Range, isNullRang
 	var builder distsql.RequestBuilder
 	kvReq, err := builder.SetIndexRanges(e.ctx.GetSessionVars().StmtCtx, e.physicalTableID, e.idxInfo.ID, ranges).
 		SetAnalyzeRequest(e.analyzePB).
+		SetStartTS(math.MaxUint64).
 		SetKeepOrder(true).
 		SetConcurrency(e.concurrency).
 		Build()
@@ -429,6 +431,7 @@ func (e *AnalyzeColumnsExec) buildResp(ranges []*ranger.Range) (distsql.SelectRe
 	// correct `correlation` of columns.
 	kvReq, err := builder.SetTableRanges(e.physicalTableID, ranges, nil).
 		SetAnalyzeRequest(e.analyzePB).
+		SetStartTS(math.MaxUint64).
 		SetKeepOrder(true).
 		SetConcurrency(e.concurrency).
 		Build()
@@ -605,7 +608,7 @@ type AnalyzeFastExec struct {
 
 func (e *AnalyzeFastExec) getSampRegionsRowCount(bo *tikv.Backoffer, needRebuild *bool, err *error, sampTasks *[]*AnalyzeFastTask) {
 	defer func() {
-		if *needRebuild == true {
+		if *needRebuild {
 			for ok := true; ok; _, ok = <-e.sampLocs {
 				// Do nothing, just clear the channel.
 			}
@@ -624,7 +627,7 @@ func (e *AnalyzeFastExec) getSampRegionsRowCount(bo *tikv.Backoffer, needRebuild
 		var resp *tikvrpc.Response
 		var rpcCtx *tikv.RPCContext
 		// we always use the first follower when follower read is enabled
-		rpcCtx, *err = e.cache.GetRPCContext(bo, loc.Region, e.ctx.GetSessionVars().ReplicaRead, 0)
+		rpcCtx, *err = e.cache.GetTiKVRPCContext(bo, loc.Region, e.ctx.GetSessionVars().GetReplicaRead(), 0)
 		if *err != nil {
 			return
 		}
@@ -925,7 +928,7 @@ func (e *AnalyzeFastExec) handleScanTasks(bo *tikv.Backoffer) (keysSize int, err
 	if err != nil {
 		return 0, err
 	}
-	if e.ctx.GetSessionVars().ReplicaRead.IsFollowerRead() {
+	if e.ctx.GetSessionVars().GetReplicaRead().IsFollowerRead() {
 		snapshot.SetOption(kv.ReplicaRead, kv.ReplicaReadFollower)
 	}
 	for _, t := range e.scanTasks {
@@ -949,7 +952,7 @@ func (e *AnalyzeFastExec) handleSampTasks(bo *tikv.Backoffer, workID int, err *e
 	if *err != nil {
 		return
 	}
-	if e.ctx.GetSessionVars().ReplicaRead.IsFollowerRead() {
+	if e.ctx.GetSessionVars().GetReplicaRead().IsFollowerRead() {
 		snapshot.SetOption(kv.ReplicaRead, kv.ReplicaReadFollower)
 	}
 	rander := rand.New(rand.NewSource(e.randSeed + int64(workID)))
@@ -1020,7 +1023,7 @@ func (e *AnalyzeFastExec) buildColumnStats(ID int64, collector *statistics.Sampl
 }
 
 func (e *AnalyzeFastExec) buildIndexStats(idxInfo *model.IndexInfo, collector *statistics.SampleCollector, rowCount int64) (*statistics.Histogram, *statistics.CMSketch, error) {
-	data := make([][][]byte, len(idxInfo.Columns), len(idxInfo.Columns))
+	data := make([][][]byte, len(idxInfo.Columns))
 	for _, sample := range collector.Samples {
 		var preLen int
 		remained := sample.Value.GetBytes()
@@ -1102,7 +1105,9 @@ func (e *AnalyzeFastExec) runTasks() ([]*statistics.Histogram, []*statistics.CMS
 		// Adjust the row count in case the count of `tblStats` is not accurate and too small.
 		rowCount = mathutil.MaxInt64(rowCount, int64(len(collector.Samples)))
 		// Scale the total column size.
-		collector.TotalSize *= rowCount / int64(len(collector.Samples))
+		if len(collector.Samples) > 0 {
+			collector.TotalSize *= rowCount / int64(len(collector.Samples))
+		}
 		if i < hasPKInfo {
 			hists[i], cms[i], err = e.buildColumnStats(e.pkInfo.ID, e.collectors[i], &e.pkInfo.FieldType, rowCount)
 		} else if i < hasPKInfo+len(e.colsInfo) {
@@ -1210,7 +1215,7 @@ type analyzeIndexIncrementalExec struct {
 
 func analyzeIndexIncremental(idxExec *analyzeIndexIncrementalExec) analyzeResult {
 	startPos := idxExec.oldHist.GetUpper(idxExec.oldHist.Len() - 1)
-	values, err := codec.DecodeRange(startPos.GetBytes(), len(idxExec.idxInfo.Columns))
+	values, _, err := codec.DecodeRange(startPos.GetBytes(), len(idxExec.idxInfo.Columns))
 	if err != nil {
 		return analyzeResult{Err: err, job: idxExec.job}
 	}

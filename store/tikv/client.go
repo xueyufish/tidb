@@ -31,10 +31,13 @@ import (
 	"github.com/pingcap/kvproto/pkg/tikvpb"
 	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/config"
+	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/metrics"
 	"github.com/pingcap/tidb/store/tikv/tikvrpc"
 	"github.com/pingcap/tidb/util/logutil"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
 )
@@ -51,6 +54,7 @@ var (
 	ReadTimeoutLong           = 150 * time.Second // For requests that may need scan region multiple times.
 	GCTimeout                 = 5 * time.Minute
 	UnsafeDestroyRangeTimeout = 5 * time.Minute
+	AccessLockObserverTimeout = 10 * time.Second
 )
 
 const (
@@ -77,21 +81,23 @@ type connArray struct {
 	streamTimeout chan *tikvrpc.Lease
 	// batchConn is not null when batch is enabled.
 	*batchConn
+	done chan struct{}
 }
 
-func newConnArray(maxSize uint, addr string, security config.Security, idleNotify *uint32, done <-chan struct{}) (*connArray, error) {
+func newConnArray(maxSize uint, addr string, security config.Security, dieNotify *uint32) (*connArray, error) {
 	a := &connArray{
 		index:         0,
 		v:             make([]*grpc.ClientConn, maxSize),
 		streamTimeout: make(chan *tikvrpc.Lease, 1024),
+		done:          make(chan struct{}),
 	}
-	if err := a.Init(addr, security, idleNotify, done); err != nil {
+	if err := a.Init(addr, security, dieNotify); err != nil {
 		return nil, err
 	}
 	return a, nil
 }
 
-func (a *connArray) Init(addr string, security config.Security, idleNotify *uint32, done <-chan struct{}) error {
+func (a *connArray) Init(addr string, security config.Security, dieNotify *uint32) error {
 	a.target = addr
 
 	opt := grpc.WithInsecure()
@@ -115,7 +121,7 @@ func (a *connArray) Init(addr string, security config.Security, idleNotify *uint
 
 	allowBatch := cfg.TiKVClient.MaxBatchSize > 0
 	if allowBatch {
-		a.batchConn = newBatchConn(uint(len(a.v)), cfg.TiKVClient.MaxBatchSize, idleNotify)
+		a.batchConn = newBatchConn(uint(len(a.v)), cfg.TiKVClient.MaxBatchSize, dieNotify)
 		a.pendingRequests = metrics.TiKVPendingBatchRequests.WithLabelValues(a.target)
 	}
 	keepAlive := cfg.TiKVClient.GrpcKeepAliveTime
@@ -131,7 +137,15 @@ func (a *connArray) Init(addr string, security config.Security, idleNotify *uint
 			grpc.WithUnaryInterceptor(unaryInterceptor),
 			grpc.WithStreamInterceptor(streamInterceptor),
 			grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(MaxRecvMsgSize)),
-			grpc.WithBackoffMaxDelay(time.Second*3),
+			grpc.WithConnectParams(grpc.ConnectParams{
+				Backoff: backoff.Config{
+					BaseDelay:  100 * time.Millisecond, // Default was 1s.
+					Multiplier: 1.6,                    // Default
+					Jitter:     0.2,                    // Default
+					MaxDelay:   3 * time.Second,        // Default was 120s.
+				},
+				MinConnectTimeout: dialTimeout,
+			}),
 			grpc.WithKeepaliveParams(keepalive.ClientParameters{
 				Time:                time.Duration(keepAlive) * time.Second,
 				Timeout:             time.Duration(keepAliveTimeout) * time.Second,
@@ -147,26 +161,21 @@ func (a *connArray) Init(addr string, security config.Security, idleNotify *uint
 		a.v[i] = conn
 
 		if allowBatch {
-			// Initialize batch streaming clients.
-			tikvClient := tikvpb.NewTikvClient(conn)
-			streamClient, err := tikvClient.BatchCommands(context.TODO())
-			if err != nil {
-				a.Close()
-				return errors.Trace(err)
-			}
 			batchClient := &batchCommandsClient{
-				target:  a.target,
-				conn:    conn,
-				client:  streamClient,
-				batched: sync.Map{},
-				idAlloc: 0,
-				closed:  0,
+				target:        a.target,
+				conn:          conn,
+				batched:       sync.Map{},
+				idAlloc:       0,
+				closed:        0,
+				tikvClientCfg: cfg.TiKVClient,
+				tikvLoad:      &a.tikvTransportLayerLoad,
+				dieNotify:     a.dieNotify,
+				dieFlag:       &a.die,
 			}
 			a.batchCommandsClients = append(a.batchCommandsClients, batchClient)
-			go batchClient.batchRecvLoop(cfg.TiKVClient, &a.tikvTransportLayerLoad)
 		}
 	}
-	go tikvrpc.CheckStreamTimeoutLoop(a.streamTimeout, done)
+	go tikvrpc.CheckStreamTimeoutLoop(a.streamTimeout, a.done)
 	if allowBatch {
 		go a.batchSendLoop(cfg.TiKVClient)
 	}
@@ -191,6 +200,8 @@ func (a *connArray) Close() {
 			a.v[i] = nil
 		}
 	}
+
+	close(a.done)
 }
 
 // rpcClient is RPC client struct.
@@ -199,28 +210,27 @@ func (a *connArray) Close() {
 // that there are too many concurrent requests which overload the service of TiKV.
 type rpcClient struct {
 	sync.RWMutex
-	done chan struct{}
 
 	conns    map[string]*connArray
 	security config.Security
 
-	idleNotify uint32
-	// Periodically check whether there is any connection that is idle and then close and remove these idle connections.
+	dieNotify uint32
+	// Periodically check whether there is any connection that was die and then close and remove these connections.
 	// Implement background cleanup.
-	isClosed bool
+	isClosed         bool
+	dieEventListener func(addr []string)
 }
 
 func newRPCClient(security config.Security) *rpcClient {
 	return &rpcClient{
-		done:     make(chan struct{}, 1),
 		conns:    make(map[string]*connArray),
 		security: security,
 	}
 }
 
 // NewTestRPCClient is for some external tests.
-func NewTestRPCClient() Client {
-	return newRPCClient(config.Security{})
+func NewTestRPCClient(security config.Security) Client {
+	return newRPCClient(security)
 }
 
 func (c *rpcClient) getConnArray(addr string) (*connArray, error) {
@@ -248,7 +258,7 @@ func (c *rpcClient) createConnArray(addr string) (*connArray, error) {
 	if !ok {
 		var err error
 		connCount := config.GetGlobalConfig().TiKVClient.GrpcConnectionCount
-		array, err = newConnArray(connCount, addr, c.security, &c.idleNotify, c.done)
+		array, err = newConnArray(connCount, addr, c.security, &c.dieNotify)
 		if err != nil {
 			return nil, err
 		}
@@ -284,8 +294,8 @@ func (c *rpcClient) SendRequest(ctx context.Context, addr string, req *tikvrpc.R
 		metrics.TiKVSendReqHistogram.WithLabelValues(reqType, storeID).Observe(time.Since(start).Seconds())
 	}()
 
-	if atomic.CompareAndSwapUint32(&c.idleNotify, 1, 0) {
-		c.recycleIdleConnArray()
+	if atomic.CompareAndSwapUint32(&c.dieNotify, 1, 0) {
+		c.recycleDieConnArray()
 	}
 
 	connArray, err := c.getConnArray(addr)
@@ -293,20 +303,27 @@ func (c *rpcClient) SendRequest(ctx context.Context, addr string, req *tikvrpc.R
 		return nil, errors.Trace(err)
 	}
 
-	if config.GetGlobalConfig().TiKVClient.MaxBatchSize > 0 {
+	// TiDB RPC server not support batch RPC now.
+	// TODO: remove this store type check after TiDB RPC Server support batch.
+	if config.GetGlobalConfig().TiKVClient.MaxBatchSize > 0 && req.StoreTp != kv.TiDB {
 		if batchReq := req.ToBatchCommandsRequest(); batchReq != nil {
 			return sendBatchRequest(ctx, addr, connArray.batchConn, batchReq, timeout)
 		}
 	}
 
+	clientConn := connArray.Get()
+	if state := clientConn.GetState(); state == connectivity.TransientFailure {
+		metrics.GRPCConnTransientFailureCounter.WithLabelValues(addr, storeID).Inc()
+	}
+
 	if req.IsDebugReq() {
-		client := debugpb.NewDebugClient(connArray.Get())
+		client := debugpb.NewDebugClient(clientConn)
 		ctx1, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 		return tikvrpc.CallDebugRPC(ctx1, client, req)
 	}
 
-	client := tikvpb.NewTikvClient(connArray.Get())
+	client := tikvpb.NewTikvClient(clientConn)
 
 	if req.Type != tikvrpc.CmdCopStream {
 		ctx1, cancel := context.WithTimeout(ctx, timeout)
@@ -349,7 +366,6 @@ func (c *rpcClient) SendRequest(ctx context.Context, addr string, req *tikvrpc.R
 
 func (c *rpcClient) Close() error {
 	// TODO: add a unit test for SendRequest After Closed
-	close(c.done)
 	c.closeConns()
 	return nil
 }

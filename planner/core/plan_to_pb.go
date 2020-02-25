@@ -21,6 +21,7 @@ import (
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/tablecodec"
+	"github.com/pingcap/tidb/util/codec"
 	"github.com/pingcap/tidb/util/ranger"
 	"github.com/pingcap/tipb/go-tipb"
 )
@@ -89,11 +90,13 @@ func (p *PhysicalLimit) ToPB(ctx sessionctx.Context) (*tipb.Executor, error) {
 
 // ToPB implements PhysicalPlan ToPB interface.
 func (p *PhysicalTableScan) ToPB(ctx sessionctx.Context) (*tipb.Executor, error) {
-	columns := p.Columns
 	tsExec := &tipb.TableScan{
 		TableId: p.Table.ID,
-		Columns: model.ColumnsToProto(columns, p.Table.PKIsHandle),
+		Columns: model.ColumnsToProto(p.Columns, p.Table.PKIsHandle),
 		Desc:    p.Desc,
+	}
+	if p.isPartition {
+		tsExec.TableId = p.physicalTableID
 	}
 	err := SetPBColumnsDefaultValue(ctx, tsExec.Columns, p.Columns)
 	return &tipb.Executor{Tp: tipb.ExecType_TypeTableScan, TblScan: tsExec}, err
@@ -114,6 +117,15 @@ func checkCoverIndex(idx *model.IndexInfo, ranges []*ranger.Range) bool {
 	return true
 }
 
+func findColumnInfoByID(infos []*model.ColumnInfo, id int64) *model.ColumnInfo {
+	for _, info := range infos {
+		if info.ID == id {
+			return info
+		}
+	}
+	return nil
+}
+
 // ToPB implements PhysicalPlan ToPB interface.
 func (p *PhysicalIndexScan) ToPB(ctx sessionctx.Context) (*tipb.Executor, error) {
 	columns := make([]*model.ColumnInfo, 0, p.schema.Len())
@@ -122,7 +134,7 @@ func (p *PhysicalIndexScan) ToPB(ctx sessionctx.Context) (*tipb.Executor, error)
 		if col.ID == model.ExtraHandleID {
 			columns = append(columns, model.NewExtraHandleColInfo())
 		} else {
-			columns = append(columns, model.FindColumnInfo(tableColumns, col.ColName.L))
+			columns = append(columns, findColumnInfoByID(tableColumns, col.ID))
 		}
 	}
 	idxExec := &tipb.IndexScan{
@@ -130,6 +142,9 @@ func (p *PhysicalIndexScan) ToPB(ctx sessionctx.Context) (*tipb.Executor, error)
 		IndexId: p.Index.ID,
 		Columns: model.ColumnsToProto(columns, p.Table.PKIsHandle),
 		Desc:    p.Desc,
+	}
+	if p.isPartition {
+		idxExec.TableId = p.physicalTableID
 	}
 	unique := checkCoverIndex(p.Index, p.Ranges)
 	idxExec.Unique = &unique
@@ -139,6 +154,11 @@ func (p *PhysicalIndexScan) ToPB(ctx sessionctx.Context) (*tipb.Executor, error)
 // SetPBColumnsDefaultValue sets the default values of tipb.ColumnInfos.
 func SetPBColumnsDefaultValue(ctx sessionctx.Context, pbColumns []*tipb.ColumnInfo, columns []*model.ColumnInfo) error {
 	for i, c := range columns {
+		// For virtual columns, we set their default values to NULL so that TiKV will return NULL properly,
+		// They real values will be compute later.
+		if c.IsGenerated() && !c.GeneratedStored {
+			pbColumns[i].DefaultVal = []byte{codec.NilFlag}
+		}
 		if c.OriginDefaultValue == nil {
 			continue
 		}
@@ -166,7 +186,7 @@ func SetPBColumnsDefaultValue(ctx sessionctx.Context, pbColumns []*tipb.ColumnIn
 // TODO: Support more kinds of physical plan.
 func SupportStreaming(p PhysicalPlan) bool {
 	switch p.(type) {
-	case *PhysicalTableScan, *PhysicalIndexScan, *PhysicalSelection:
+	case *PhysicalIndexScan, *PhysicalSelection, *PhysicalTableScan:
 		return true
 	}
 	return false

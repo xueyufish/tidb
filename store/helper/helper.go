@@ -18,10 +18,12 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -67,10 +69,10 @@ func (h *Helper) GetMvccByEncodedKey(encodedKey kv.Key) (*kvrpcpb.MvccGetByKeyRe
 	kvResp, err := h.Store.SendReq(tikv.NewBackoffer(context.Background(), 500), tikvReq, keyLocation.Region, time.Minute)
 	if err != nil {
 		logutil.BgLogger().Info("get MVCC by encoded key failed",
-			zap.Binary("encodeKey", encodedKey),
+			zap.Stringer("encodeKey", encodedKey),
 			zap.Reflect("region", keyLocation.Region),
-			zap.Binary("startKey", keyLocation.StartKey),
-			zap.Binary("endKey", keyLocation.EndKey),
+			zap.Stringer("startKey", keyLocation.StartKey),
+			zap.Stringer("endKey", keyLocation.EndKey),
 			zap.Reflect("kvResp", kvResp),
 			zap.Error(err))
 		return nil, errors.Trace(err)
@@ -94,9 +96,9 @@ type HotRegionsStat struct {
 // RegionStat records each hot region's statistics
 // it's the response of PD.
 type RegionStat struct {
-	RegionID  uint64 `json:"region_id"`
-	FlowBytes uint64 `json:"flow_bytes"`
-	HotDegree int    `json:"hot_degree"`
+	RegionID  uint64  `json:"region_id"`
+	FlowBytes float64 `json:"flow_bytes"`
+	HotDegree int     `json:"hot_degree"`
 }
 
 // RegionMetric presents the final metric output entry.
@@ -144,10 +146,14 @@ func (h *Helper) FetchHotRegion(rw string) (map[uint64]RegionMetric, error) {
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	metric := make(map[uint64]RegionMetric)
+	metricCnt := 0
+	for _, hotRegions := range regionResp.AsLeader {
+		metricCnt += len(hotRegions.RegionsStat)
+	}
+	metric := make(map[uint64]RegionMetric, metricCnt)
 	for _, hotRegions := range regionResp.AsLeader {
 		for _, region := range hotRegions.RegionsStat {
-			metric[region.RegionID] = RegionMetric{FlowBytes: region.FlowBytes, MaxHotDegree: region.HotDegree}
+			metric[region.RegionID] = RegionMetric{FlowBytes: uint64(region.FlowBytes), MaxHotDegree: region.HotDegree}
 		}
 	}
 	return metric, nil
@@ -225,14 +231,36 @@ func (h *Helper) FetchRegionTableIndex(metrics map[uint64]RegionMetric, allSchem
 func (h *Helper) FindTableIndexOfRegion(allSchemas []*model.DBInfo, hotRange *RegionFrameRange) *FrameItem {
 	for _, db := range allSchemas {
 		for _, tbl := range db.Tables {
-			if f := hotRange.GetRecordFrame(tbl.ID, db.Name.O, tbl.Name.O); f != nil {
+			if f := findRangeInTable(hotRange, db, tbl); f != nil {
 				return f
 			}
-			for _, idx := range tbl.Indices {
-				if f := hotRange.GetIndexFrame(tbl.ID, idx.ID, db.Name.O, tbl.Name.O, idx.Name.O); f != nil {
-					return f
-				}
-			}
+		}
+	}
+	return nil
+}
+
+func findRangeInTable(hotRange *RegionFrameRange, db *model.DBInfo, tbl *model.TableInfo) *FrameItem {
+	pi := tbl.GetPartitionInfo()
+	if pi == nil {
+		return findRangeInPhysicalTable(hotRange, tbl.ID, db.Name.O, tbl.Name.O, tbl.Indices)
+	}
+
+	for _, def := range pi.Definitions {
+		tablePartition := fmt.Sprintf("%s(%s)", tbl.Name.O, def.Name)
+		if f := findRangeInPhysicalTable(hotRange, def.ID, db.Name.O, tablePartition, tbl.Indices); f != nil {
+			return f
+		}
+	}
+	return nil
+}
+
+func findRangeInPhysicalTable(hotRange *RegionFrameRange, physicalID int64, dbName, tblName string, indices []*model.IndexInfo) *FrameItem {
+	if f := hotRange.GetRecordFrame(physicalID, dbName, tblName); f != nil {
+		return f
+	}
+	for _, idx := range indices {
+		if f := hotRange.GetIndexFrame(physicalID, idx.ID, dbName, tblName, idx.Name.O); f != nil {
+			return f
 		}
 	}
 	return nil
@@ -435,11 +463,6 @@ func isIntersectingKeyRange(x withKeyRange, startKey, endKey string) bool {
 	return !isBeforeKeyRange(x, startKey, endKey) && !isBehindKeyRange(x, startKey, endKey)
 }
 
-// IsBefore returns true is x is before y
-func inBefore(x, y withKeyRange) bool {
-	return isBeforeKeyRange(x, y.getStartKey(), y.getEndKey())
-}
-
 // isBehind returns true is x is behind y
 func isBehind(x, y withKeyRange) bool {
 	return isBehindKeyRange(x, y.getStartKey(), y.getEndKey())
@@ -522,9 +545,9 @@ func newIndexWithKeyRange(db *model.DBInfo, table *model.TableInfo, index *model
 // Assuming tables or indices key ranges never intersect.
 // Regions key ranges can intersect.
 func (h *Helper) GetRegionsTableInfo(regionsInfo *RegionsInfo, schemas []*model.DBInfo) map[int64][]TableInfo {
-	tableInfos := make(map[int64][]TableInfo)
+	tableInfos := make(map[int64][]TableInfo, len(regionsInfo.Regions))
 
-	regions := []*RegionInfo{}
+	regions := make([]*RegionInfo, 0, len(regionsInfo.Regions))
 	for i := 0; i < len(regionsInfo.Regions); i++ {
 		tableInfos[regionsInfo.Regions[i].ID] = []TableInfo{}
 		regions = append(regions, &regionsInfo.Regions[i])
@@ -569,15 +592,18 @@ func bytesKeyToHex(key []byte) string {
 	return strings.ToUpper(hex.EncodeToString(key))
 }
 
-func hexKeyToBytes(key string) ([]byte, error) {
-	return hex.DecodeString(key)
-}
-
 // GetRegionsInfo gets the region information of current store by using PD's api.
 func (h *Helper) GetRegionsInfo() (*RegionsInfo, error) {
 	var regionsInfo RegionsInfo
 	err := h.requestPD("GET", pdapi.Regions, nil, &regionsInfo)
 	return &regionsInfo, err
+}
+
+// GetRegionInfoByID gets the region information of the region ID by using PD's api.
+func (h *Helper) GetRegionInfoByID(regionID uint64) (*RegionInfo, error) {
+	var regionInfo RegionInfo
+	err := h.requestPD("GET", pdapi.RegionByID+strconv.FormatUint(regionID, 10), nil, &regionInfo)
+	return &regionInfo, err
 }
 
 // request PD API, decode the response body into res
@@ -630,12 +656,15 @@ type StoreStat struct {
 
 // StoreBaseStat stores the basic information of one store.
 type StoreBaseStat struct {
-	ID        int64        `json:"id"`
-	Address   string       `json:"address"`
-	State     int64        `json:"state"`
-	StateName string       `json:"state_name"`
-	Version   string       `json:"version"`
-	Labels    []StoreLabel `json:"labels"`
+	ID             int64        `json:"id"`
+	Address        string       `json:"address"`
+	State          int64        `json:"state"`
+	StateName      string       `json:"state_name"`
+	Version        string       `json:"version"`
+	Labels         []StoreLabel `json:"labels"`
+	StatusAddress  string       `json:"status_address"`
+	GitHash        string       `json:"git_hash"`
+	StartTimestamp int64        `json:"start_timestamp"`
 }
 
 // StoreLabel stores the information of one store label.
@@ -649,12 +678,12 @@ type StoreDetailStat struct {
 	Capacity        string    `json:"capacity"`
 	Available       string    `json:"available"`
 	LeaderCount     int64     `json:"leader_count"`
-	LeaderWeight    int64     `json:"leader_weight"`
-	LeaderScore     int64     `json:"leader_score"`
+	LeaderWeight    float64   `json:"leader_weight"`
+	LeaderScore     float64   `json:"leader_score"`
 	LeaderSize      int64     `json:"leader_size"`
 	RegionCount     int64     `json:"region_count"`
-	RegionWeight    int64     `json:"region_weight"`
-	RegionScore     int64     `json:"region_score"`
+	RegionWeight    float64   `json:"region_weight"`
+	RegionScore     float64   `json:"region_score"`
 	RegionSize      int64     `json:"region_size"`
 	StartTs         time.Time `json:"start_ts"`
 	LastHeartbeatTs time.Time `json:"last_heartbeat_ts"`

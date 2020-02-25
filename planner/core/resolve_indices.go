@@ -121,19 +121,19 @@ func (p *PhysicalMergeJoin) ResolveIndices() (err error) {
 	}
 	lSchema := p.children[0].Schema()
 	rSchema := p.children[1].Schema()
-	for i, col := range p.LeftKeys {
+	for i, col := range p.LeftJoinKeys {
 		newKey, err := col.ResolveIndices(lSchema)
 		if err != nil {
 			return err
 		}
-		p.LeftKeys[i] = newKey.(*expression.Column)
+		p.LeftJoinKeys[i] = newKey.(*expression.Column)
 	}
-	for i, col := range p.RightKeys {
+	for i, col := range p.RightJoinKeys {
 		newKey, err := col.ResolveIndices(rSchema)
 		if err != nil {
 			return err
 		}
-		p.RightKeys[i] = newKey.(*expression.Column)
+		p.RightJoinKeys[i] = newKey.(*expression.Column)
 	}
 	for i, expr := range p.LeftConditions {
 		p.LeftConditions[i], err = expr.ResolveIndices(lSchema)
@@ -165,12 +165,12 @@ func (p *PhysicalIndexJoin) ResolveIndices() (err error) {
 	lSchema := p.children[0].Schema()
 	rSchema := p.children[1].Schema()
 	for i := range p.InnerJoinKeys {
-		newOuterKey, err := p.OuterJoinKeys[i].ResolveIndices(p.children[p.OuterIndex].Schema())
+		newOuterKey, err := p.OuterJoinKeys[i].ResolveIndices(p.children[1-p.InnerChildIdx].Schema())
 		if err != nil {
 			return err
 		}
 		p.OuterJoinKeys[i] = newOuterKey.(*expression.Column)
-		newInnerKey, err := p.InnerJoinKeys[i].ResolveIndices(p.children[1-p.OuterIndex].Schema())
+		newInnerKey, err := p.InnerJoinKeys[i].ResolveIndices(p.children[p.InnerChildIdx].Schema())
 		if err != nil {
 			return err
 		}
@@ -196,12 +196,12 @@ func (p *PhysicalIndexJoin) ResolveIndices() (err error) {
 		}
 	}
 	if p.CompareFilters != nil {
-		err = p.CompareFilters.resolveIndices(p.children[p.OuterIndex].Schema())
+		err = p.CompareFilters.resolveIndices(p.children[1-p.InnerChildIdx].Schema())
 		if err != nil {
 			return err
 		}
 		for i := range p.CompareFilters.affectedColSchema.Columns {
-			resolvedCol, err1 := p.CompareFilters.affectedColSchema.Columns[i].ResolveIndices(p.children[p.OuterIndex].Schema())
+			resolvedCol, err1 := p.CompareFilters.affectedColSchema.Columns[i].ResolveIndices(p.children[1-p.InnerChildIdx].Schema())
 			if err1 != nil {
 				return err1
 			}
@@ -231,8 +231,26 @@ func (p *PhysicalUnionScan) ResolveIndices() (err error) {
 	return
 }
 
+// resolveIndicesForVirtualColumn resolves dependent columns's indices for virtual columns.
+func resolveIndicesForVirtualColumn(result []*expression.Column, schema *expression.Schema) error {
+	for _, col := range result {
+		if col.VirtualExpr != nil {
+			newExpr, err := col.VirtualExpr.ResolveIndices(schema)
+			if err != nil {
+				return err
+			}
+			col.VirtualExpr = newExpr
+		}
+	}
+	return nil
+}
+
 // ResolveIndices implements Plan interface.
 func (p *PhysicalTableReader) ResolveIndices() error {
+	err := resolveIndicesForVirtualColumn(p.schema.Columns, p.schema)
+	if err != nil {
+		return err
+	}
 	return p.tablePlan.ResolveIndices()
 }
 
@@ -258,6 +276,10 @@ func (p *PhysicalIndexReader) ResolveIndices() (err error) {
 
 // ResolveIndices implements Plan interface.
 func (p *PhysicalIndexLookUpReader) ResolveIndices() (err error) {
+	err = resolveIndicesForVirtualColumn(p.tablePlan.Schema().Columns, p.schema)
+	if err != nil {
+		return err
+	}
 	err = p.tablePlan.ResolveIndices()
 	if err != nil {
 		return err
@@ -274,6 +296,23 @@ func (p *PhysicalIndexLookUpReader) ResolveIndices() (err error) {
 		p.ExtraHandleCol = newCol.(*expression.Column)
 	}
 	return
+}
+
+// ResolveIndices implements Plan interface.
+func (p *PhysicalIndexMergeReader) ResolveIndices() (err error) {
+	if p.tablePlan != nil {
+		err = p.tablePlan.ResolveIndices()
+		if err != nil {
+			return err
+		}
+	}
+	for i := 0; i < len(p.partialPlans); i++ {
+		err = p.partialPlans[i].ResolveIndices()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ResolveIndices implements Plan interface.
@@ -380,6 +419,22 @@ func (p *PhysicalWindow) ResolveIndices() (err error) {
 		}
 	}
 	return nil
+}
+
+// ResolveIndices implements Plan interface.
+func (p *PhysicalShuffle) ResolveIndices() (err error) {
+	err = p.basePhysicalPlan.ResolveIndices()
+	if err != nil {
+		return err
+	}
+	for i := range p.HashByItems {
+		// "Shuffle" get value of items from `DataSource`, other than children[0].
+		p.HashByItems[i], err = p.HashByItems[i].ResolveIndices(p.DataSource.Schema())
+		if err != nil {
+			return err
+		}
+	}
+	return err
 }
 
 // ResolveIndices implements Plan interface.

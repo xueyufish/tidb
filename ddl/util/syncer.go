@@ -23,15 +23,15 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/coreos/etcd/clientv3"
-	"github.com/coreos/etcd/clientv3/concurrency"
-	"github.com/coreos/etcd/etcdserver/api/v3rpc/rpctypes"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/metrics"
 	"github.com/pingcap/tidb/owner"
 	"github.com/pingcap/tidb/util/logutil"
+	"go.etcd.io/etcd/clientv3"
+	"go.etcd.io/etcd/clientv3/concurrency"
+	"go.etcd.io/etcd/etcdserver/api/v3rpc/rpctypes"
 	"go.uber.org/zap"
 )
 
@@ -62,8 +62,6 @@ var (
 	// SyncerSessionTTL is the etcd session's TTL in seconds.
 	// and it's an exported variable for testing.
 	SyncerSessionTTL = 90
-	// ddlLogCtx uses for log.
-	ddlLogCtx = context.Background()
 )
 
 // SchemaSyncer is used to synchronize schema version between the DDL worker leader and followers through etcd.
@@ -198,7 +196,7 @@ func (s *schemaVersionSyncer) Done() <-chan struct{} {
 	failpoint.Inject("ErrorMockSessionDone", func(val failpoint.Value) {
 		if val.(bool) {
 			err := s.loadSession().Close()
-			logutil.BgLogger().Info("close session failed", zap.Error(err))
+			logutil.BgLogger().Error("close session failed", zap.Error(err))
 		}
 	})
 

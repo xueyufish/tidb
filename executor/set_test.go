@@ -27,7 +27,7 @@ import (
 	"github.com/pingcap/tidb/util/testutil"
 )
 
-func (s *testSuite2) TestSetVar(c *C) {
+func (s *testSuite5) TestSetVar(c *C) {
 	tk := testkit.NewTestKit(c, s.store)
 	testSQL := "SET @a = 1;"
 	tk.MustExec(testSQL)
@@ -153,12 +153,12 @@ func (s *testSuite2) TestSetVar(c *C) {
 	tk.MustQuery("select @@session.transaction_isolation").Check(testkit.Rows("READ-COMMITTED"))
 	// error
 	_, err = tk.Exec("SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED")
-	c.Assert(terror.ErrorEqual(err, variable.ErrUnsupportedValueForVar), IsTrue, Commentf("err %v", err))
+	c.Assert(terror.ErrorEqual(err, variable.ErrUnsupportedIsolationLevel), IsTrue, Commentf("err %v", err))
 	tk.MustQuery("select @@session.tx_isolation").Check(testkit.Rows("READ-COMMITTED"))
 	tk.MustQuery("select @@session.transaction_isolation").Check(testkit.Rows("READ-COMMITTED"))
 	// Fails
 	_, err = tk.Exec("SET GLOBAL TRANSACTION ISOLATION LEVEL SERIALIZABLE")
-	c.Assert(terror.ErrorEqual(err, variable.ErrUnsupportedValueForVar), IsTrue, Commentf("err %v", err))
+	c.Assert(terror.ErrorEqual(err, variable.ErrUnsupportedIsolationLevel), IsTrue, Commentf("err %v", err))
 	tk.MustQuery("select @@global.tx_isolation").Check(testkit.Rows("REPEATABLE-READ"))
 	tk.MustQuery("select @@global.transaction_isolation").Check(testkit.Rows("REPEATABLE-READ"))
 
@@ -168,29 +168,29 @@ func (s *testSuite2) TestSetVar(c *C) {
 	tk.MustQuery("select @@session.transaction_isolation").Check(testkit.Rows("READ-COMMITTED"))
 
 	_, err = tk.Exec("SET SESSION tx_isolation = 'READ-UNCOMMITTED'")
-	c.Assert(terror.ErrorEqual(err, variable.ErrUnsupportedValueForVar), IsTrue, Commentf("err %v", err))
+	c.Assert(terror.ErrorEqual(err, variable.ErrUnsupportedIsolationLevel), IsTrue, Commentf("err %v", err))
 	tk.MustQuery("select @@session.tx_isolation").Check(testkit.Rows("READ-COMMITTED"))
 	tk.MustQuery("select @@session.transaction_isolation").Check(testkit.Rows("READ-COMMITTED"))
 
 	// fails
 	_, err = tk.Exec("SET SESSION transaction_isolation = 'SERIALIZABLE'")
-	c.Assert(terror.ErrorEqual(err, variable.ErrUnsupportedValueForVar), IsTrue, Commentf("err %v", err))
+	c.Assert(terror.ErrorEqual(err, variable.ErrUnsupportedIsolationLevel), IsTrue, Commentf("err %v", err))
 	tk.MustQuery("select @@session.tx_isolation").Check(testkit.Rows("READ-COMMITTED"))
 	tk.MustQuery("select @@session.transaction_isolation").Check(testkit.Rows("READ-COMMITTED"))
 
 	// fails
 	_, err = tk.Exec("SET GLOBAL transaction_isolation = 'SERIALIZABLE'")
-	c.Assert(terror.ErrorEqual(err, variable.ErrUnsupportedValueForVar), IsTrue, Commentf("err %v", err))
+	c.Assert(terror.ErrorEqual(err, variable.ErrUnsupportedIsolationLevel), IsTrue, Commentf("err %v", err))
 	tk.MustQuery("select @@global.tx_isolation").Check(testkit.Rows("REPEATABLE-READ"))
 	tk.MustQuery("select @@global.transaction_isolation").Check(testkit.Rows("REPEATABLE-READ"))
 
 	_, err = tk.Exec("SET GLOBAL transaction_isolation = 'READ-UNCOMMITTED'")
-	c.Assert(terror.ErrorEqual(err, variable.ErrUnsupportedValueForVar), IsTrue, Commentf("err %v", err))
+	c.Assert(terror.ErrorEqual(err, variable.ErrUnsupportedIsolationLevel), IsTrue, Commentf("err %v", err))
 	tk.MustQuery("select @@global.tx_isolation").Check(testkit.Rows("REPEATABLE-READ"))
 	tk.MustQuery("select @@global.transaction_isolation").Check(testkit.Rows("REPEATABLE-READ"))
 
 	_, err = tk.Exec("SET GLOBAL tx_isolation = 'SERIALIZABLE'")
-	c.Assert(terror.ErrorEqual(err, variable.ErrUnsupportedValueForVar), IsTrue, Commentf("err %v", err))
+	c.Assert(terror.ErrorEqual(err, variable.ErrUnsupportedIsolationLevel), IsTrue, Commentf("err %v", err))
 	tk.MustQuery("select @@global.tx_isolation").Check(testkit.Rows("REPEATABLE-READ"))
 	tk.MustQuery("select @@global.transaction_isolation").Check(testkit.Rows("REPEATABLE-READ"))
 
@@ -247,6 +247,9 @@ func (s *testSuite2) TestSetVar(c *C) {
 	tk.MustExec("set @@tidb_general_log = 1")
 	tk.MustExec("set @@tidb_general_log = 0")
 
+	tk.MustExec("set @@tidb_pprof_sql_cpu = 1")
+	tk.MustExec("set @@tidb_pprof_sql_cpu = 0")
+
 	tk.MustExec(`set tidb_force_priority = "no_priority"`)
 	tk.MustQuery(`select @@tidb_force_priority;`).Check(testkit.Rows("NO_PRIORITY"))
 	tk.MustExec(`set tidb_force_priority = "low_priority"`)
@@ -264,20 +267,6 @@ func (s *testSuite2) TestSetVar(c *C) {
 	tk.MustQuery(`select @@session.tidb_constraint_check_in_place;`).Check(testkit.Rows("1"))
 	tk.MustExec("set global tidb_constraint_check_in_place = 0")
 	tk.MustQuery(`select @@global.tidb_constraint_check_in_place;`).Check(testkit.Rows("0"))
-
-	tk.MustExec("set tidb_slow_log_threshold = 0")
-	tk.MustQuery("select @@session.tidb_slow_log_threshold;").Check(testkit.Rows("0"))
-	tk.MustExec("set tidb_slow_log_threshold = 1")
-	tk.MustQuery("select @@session.tidb_slow_log_threshold;").Check(testkit.Rows("1"))
-	_, err = tk.Exec("set global tidb_slow_log_threshold = 0")
-	c.Assert(err, NotNil)
-
-	tk.MustExec("set tidb_query_log_max_len = 0")
-	tk.MustQuery("select @@session.tidb_query_log_max_len;").Check(testkit.Rows("0"))
-	tk.MustExec("set tidb_query_log_max_len = 20")
-	tk.MustQuery("select @@session.tidb_query_log_max_len;").Check(testkit.Rows("20"))
-	_, err = tk.Exec("set global tidb_query_log_max_len = 20")
-	c.Assert(err, NotNil)
 
 	tk.MustExec("set tidb_batch_commit = 0")
 	tk.MustQuery("select @@session.tidb_batch_commit;").Check(testkit.Rows("0"))
@@ -314,7 +303,7 @@ func (s *testSuite2) TestSetVar(c *C) {
 	tk.MustExec("SET SESSION tidb_skip_isolation_level_check = 1")
 	tk.MustExec("SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE")
 	tk.MustQuery("show warnings").Check(testkit.Rows(
-		"Warning 1105 The isolation level 'SERIALIZABLE' is not supported. Set tidb_skip_isolation_level_check=1 to skip this error"))
+		"Warning 8048 The isolation level 'SERIALIZABLE' is not supported. Set tidb_skip_isolation_level_check=1 to skip this error"))
 	tk.MustQuery("select @@session.tx_isolation").Check(testkit.Rows("SERIALIZABLE"))
 	tk.MustQuery("select @@session.transaction_isolation").Check(testkit.Rows("SERIALIZABLE"))
 
@@ -323,7 +312,7 @@ func (s *testSuite2) TestSetVar(c *C) {
 	tk.MustExec("SET SESSION tidb_skip_isolation_level_check = 1")
 	tk.MustExec("SET GLOBAL TRANSACTION ISOLATION LEVEL READ UNCOMMITTED")
 	tk.MustQuery("show warnings").Check(testkit.Rows(
-		"Warning 1105 The isolation level 'READ-UNCOMMITTED' is not supported. Set tidb_skip_isolation_level_check=1 to skip this error"))
+		"Warning 8048 The isolation level 'READ-UNCOMMITTED' is not supported. Set tidb_skip_isolation_level_check=1 to skip this error"))
 	tk.MustQuery("select @@global.tx_isolation").Check(testkit.Rows("READ-UNCOMMITTED"))
 	tk.MustQuery("select @@global.transaction_isolation").Check(testkit.Rows("READ-UNCOMMITTED"))
 
@@ -383,34 +372,136 @@ func (s *testSuite2) TestSetVar(c *C) {
 
 	tk.MustExec("set @@tidb_expensive_query_time_threshold=70")
 	tk.MustQuery("select @@tidb_expensive_query_time_threshold;").Check(testkit.Rows("70"))
+
+	tk.MustQuery("select @@tidb_store_limit;").Check(testkit.Rows("0"))
+	tk.MustExec("set @@tidb_store_limit = 100")
+	tk.MustQuery("select @@tidb_store_limit;").Check(testkit.Rows("100"))
+	tk.MustQuery("select @@session.tidb_store_limit;").Check(testkit.Rows("100"))
+	tk.MustQuery("select @@global.tidb_store_limit;").Check(testkit.Rows("0"))
+	tk.MustExec("set @@tidb_store_limit = 0")
+
+	tk.MustExec("set global tidb_store_limit = 100")
+	tk.MustQuery("select @@tidb_store_limit;").Check(testkit.Rows("0"))
+	tk.MustQuery("select @@session.tidb_store_limit;").Check(testkit.Rows("0"))
+	tk.MustQuery("select @@global.tidb_store_limit;").Check(testkit.Rows("100"))
+
+	tk.MustQuery("select @@session.tidb_metric_query_step;").Check(testkit.Rows("60"))
+	tk.MustExec("set @@session.tidb_metric_query_step = 120")
+	_, err = tk.Exec("set @@session.tidb_metric_query_step = 9")
+	c.Assert(err, NotNil)
+	c.Assert(err.Error(), Equals, "tidb_metric_query_step(9) cannot be smaller than 10 or larger than 216000")
+	tk.MustQuery("select @@session.tidb_metric_query_step;").Check(testkit.Rows("120"))
+
+	tk.MustQuery("select @@session.tidb_metric_query_range_duration;").Check(testkit.Rows("60"))
+	tk.MustExec("set @@session.tidb_metric_query_range_duration = 120")
+	_, err = tk.Exec("set @@session.tidb_metric_query_range_duration = 9")
+	c.Assert(err, NotNil)
+	c.Assert(err.Error(), Equals, "tidb_metric_query_range_duration(9) cannot be smaller than 10 or larger than 216000")
+	tk.MustQuery("select @@session.tidb_metric_query_range_duration;").Check(testkit.Rows("120"))
 }
 
-func (s *testSuite2) TestSetCharset(c *C) {
-	tk := testkit.NewTestKit(c, s.store)
-	tk.MustExec(`SET NAMES latin1`)
-
+func (s *testSuite5) TestSetCharset(c *C) {
+	tk := testkit.NewTestKitWithInit(c, s.store)
 	ctx := tk.Se.(sessionctx.Context)
 	sessionVars := ctx.GetSessionVars()
-	for _, v := range variable.SetNamesVariables {
-		sVar, err := variable.GetSessionSystemVar(sessionVars, v)
-		c.Assert(err, IsNil)
-		c.Assert(sVar != "utf8", IsTrue)
-	}
-	tk.MustExec(`SET NAMES utf8`)
-	for _, v := range variable.SetNamesVariables {
-		sVar, err := variable.GetSessionSystemVar(sessionVars, v)
-		c.Assert(err, IsNil)
-		c.Assert(sVar, Equals, "utf8")
-	}
-	sVar, err := variable.GetSessionSystemVar(sessionVars, variable.CollationConnection)
-	c.Assert(err, IsNil)
-	c.Assert(sVar, Equals, "utf8_bin")
 
-	// Issue 1523
+	var characterSetVariables = []string{
+		"character_set_client",
+		"character_set_connection",
+		"character_set_results",
+		"character_set_server",
+		"character_set_database",
+		"character_set_system",
+		"character_set_filesystem",
+	}
+
+	check := func(args ...string) {
+		for i, v := range characterSetVariables {
+			sVar, err := variable.GetSessionSystemVar(sessionVars, v)
+			c.Assert(err, IsNil)
+			c.Assert(sVar, Equals, args[i], Commentf("%d: %s", i, characterSetVariables[i]))
+		}
+	}
+
+	check(
+		"utf8mb4",
+		"utf8mb4",
+		"utf8mb4",
+		"utf8mb4",
+		"utf8mb4",
+		"utf8",
+		"binary",
+	)
+
+	tk.MustExec(`SET NAMES latin1`)
+	check(
+		"latin1",
+		"latin1",
+		"latin1",
+		"utf8mb4",
+		"utf8mb4",
+		"utf8",
+		"binary",
+	)
+
+	tk.MustExec(`SET NAMES default`)
+	check(
+		"utf8mb4",
+		"utf8mb4",
+		"utf8mb4",
+		"utf8mb4",
+		"utf8mb4",
+		"utf8",
+		"binary",
+	)
+
+	// Issue #1523
 	tk.MustExec(`SET NAMES binary`)
+	check(
+		"binary",
+		"binary",
+		"binary",
+		"utf8mb4",
+		"utf8mb4",
+		"utf8",
+		"binary",
+	)
+
+	tk.MustExec(`SET NAMES utf8`)
+	check(
+		"utf8",
+		"utf8",
+		"utf8",
+		"utf8mb4",
+		"utf8mb4",
+		"utf8",
+		"binary",
+	)
+
+	tk.MustExec(`SET CHARACTER SET latin1`)
+	check(
+		"latin1",
+		"latin1",
+		"latin1",
+		"utf8mb4",
+		"utf8mb4",
+		"utf8",
+		"binary",
+	)
+
+	tk.MustExec(`SET CHARACTER SET default`)
+	check(
+		"utf8mb4",
+		"utf8mb4",
+		"utf8mb4",
+		"utf8mb4",
+		"utf8mb4",
+		"utf8",
+		"binary",
+	)
 }
 
-func (s *testSuite2) TestValidateSetVar(c *C) {
+func (s *testSuite5) TestValidateSetVar(c *C) {
 	tk := testkit.NewTestKit(c, s.store)
 
 	_, err := tk.Exec("set global tidb_distsql_scan_concurrency='fff';")
@@ -445,6 +536,11 @@ func (s *testSuite2) TestValidateSetVar(c *C) {
 
 	tk.MustExec("set @@tidb_general_log=0;")
 	tk.MustQuery("select @@tidb_general_log;").Check(testkit.Rows("0"))
+
+	tk.MustExec("set @@tidb_pprof_sql_cpu=1;")
+	tk.MustQuery("select @@tidb_pprof_sql_cpu;").Check(testkit.Rows("1"))
+	tk.MustExec("set @@tidb_pprof_sql_cpu=0;")
+	tk.MustQuery("select @@tidb_pprof_sql_cpu;").Check(testkit.Rows("0"))
 
 	tk.MustExec("set @@tidb_enable_streaming=1;")
 	tk.MustQuery("select @@tidb_enable_streaming;").Check(testkit.Rows("1"))
@@ -500,6 +596,19 @@ func (s *testSuite2) TestValidateSetVar(c *C) {
 	result.Check(testkit.Rows("1"))
 
 	_, err = tk.Exec("set @@global.max_connections='hello'")
+	c.Assert(terror.ErrorEqual(err, variable.ErrWrongTypeForVar), IsTrue)
+
+	tk.MustExec("set @@global.thread_pool_size=65")
+	tk.MustQuery("show warnings").Check(testutil.RowsWithSep("|", "Warning|1292|Truncated incorrect thread_pool_size value: '65'"))
+	result = tk.MustQuery("select @@global.thread_pool_size;")
+	result.Check(testkit.Rows("64"))
+
+	tk.MustExec("set @@global.thread_pool_size=-1")
+	tk.MustQuery("show warnings").Check(testutil.RowsWithSep("|", "Warning|1292|Truncated incorrect thread_pool_size value: '-1'"))
+	result = tk.MustQuery("select @@global.thread_pool_size;")
+	result.Check(testkit.Rows("1"))
+
+	_, err = tk.Exec("set @@global.thread_pool_size='hello'")
 	c.Assert(terror.ErrorEqual(err, variable.ErrWrongTypeForVar), IsTrue)
 
 	tk.MustExec("set @@global.max_allowed_packet=-1")
@@ -747,10 +856,10 @@ func (s *testSuite2) TestValidateSetVar(c *C) {
 	tk.MustExec("SET GLOBAL tidb_skip_isolation_level_check = 0")
 	tk.MustExec("SET SESSION tidb_skip_isolation_level_check = 0")
 	_, err = tk.Exec("set @@tx_isolation='SERIALIZABLE'")
-	c.Assert(terror.ErrorEqual(err, variable.ErrUnsupportedValueForVar), IsTrue, Commentf("err %v", err))
+	c.Assert(terror.ErrorEqual(err, variable.ErrUnsupportedIsolationLevel), IsTrue, Commentf("err %v", err))
 }
 
-func (s *testSuite2) TestSelectGlobalVar(c *C) {
+func (s *testSuite5) TestSelectGlobalVar(c *C) {
 	tk := testkit.NewTestKit(c, s.store)
 
 	tk.MustQuery("select @@global.max_connections;").Check(testkit.Rows("151"))
@@ -765,12 +874,12 @@ func (s *testSuite2) TestSelectGlobalVar(c *C) {
 
 	// test for unknown variable.
 	err := tk.ExecToErr("select @@invalid")
-	c.Assert(terror.ErrorEqual(err, variable.UnknownSystemVar), IsTrue, Commentf("err %v", err))
+	c.Assert(terror.ErrorEqual(err, variable.ErrUnknownSystemVar), IsTrue, Commentf("err %v", err))
 	err = tk.ExecToErr("select @@global.invalid")
-	c.Assert(terror.ErrorEqual(err, variable.UnknownSystemVar), IsTrue, Commentf("err %v", err))
+	c.Assert(terror.ErrorEqual(err, variable.ErrUnknownSystemVar), IsTrue, Commentf("err %v", err))
 }
 
-func (s *testSuite2) TestEnableNoopFunctionsVar(c *C) {
+func (s *testSuite5) TestEnableNoopFunctionsVar(c *C) {
 	tk := testkit.NewTestKit(c, s.store)
 
 	// test for tidb_enable_noop_functions

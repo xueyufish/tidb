@@ -1,4 +1,4 @@
-// Copyright 2019 PingCAP, Inc.
+// Copyright 2020 PingCAP, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,33 +14,43 @@
 package executor_test
 
 import (
+	"fmt"
+
 	. "github.com/pingcap/check"
+	"github.com/pingcap/tidb/config"
+	"github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/testkit"
 )
 
-func (s *testSuite4) TestSortRand(c *C) {
+func (s *testSuite) TestSortInDisk(c *C) {
+	originCfg := config.GetGlobalConfig()
+	newConf := *originCfg
+	newConf.OOMUseTmpStorage = true
+	config.StoreGlobalConfig(&newConf)
+	defer config.StoreGlobalConfig(originCfg)
+
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
+
+	sm := &mockSessionManager1{
+		PS: make([]*util.ProcessInfo, 0),
+	}
+	tk.Se.SetSessionManager(sm)
+	s.domain.ExpensiveQueryHandle().SetSessionManager(sm)
+
+	tk.MustExec("set @@tidb_mem_quota_query=1;")
+	tk.MustExec("set @@tidb_max_chunk_size=32;")
 	tk.MustExec("drop table if exists t")
-	tk.MustExec("create table t(a int, b int);")
-
-	tk.MustQuery("explain select a from t order by rand()").Check(testkit.Rows(
-		"Projection_8 10000.00 root test.t.a",
-		"└─Sort_4 10000.00 root col_1:asc",
-		"  └─Projection_9 10000.00 root test.t.a, rand()",
-		"    └─TableReader_7 10000.00 root data:TableScan_6",
-		"      └─TableScan_6 10000.00 cop table:t, range:[-inf,+inf], keep order:false, stats:pseudo",
-	))
-
-	tk.MustQuery("explain select a, b from t order by abs(2)").Check(testkit.Rows(
-		"TableReader_8 10000.00 root data:TableScan_7",
-		"└─TableScan_7 10000.00 cop table:t, range:[-inf,+inf], keep order:false, stats:pseudo"))
-
-	tk.MustQuery("explain select a from t order by abs(rand())+1").Check(testkit.Rows(
-		"Projection_8 10000.00 root test.t.a",
-		"└─Sort_4 10000.00 root col_1:asc",
-		"  └─Projection_9 10000.00 root test.t.a, plus(abs(rand()), 1)",
-		"    └─TableReader_7 10000.00 root data:TableScan_6",
-		"      └─TableScan_6 10000.00 cop table:t, range:[-inf,+inf], keep order:false, stats:pseudo",
-	))
+	tk.MustExec("create table t(c1 int, c2 int, c3 int)")
+	for i := 0; i < 5; i++ {
+		for j := i; j < 1024; j += 5 {
+			tk.MustExec(fmt.Sprintf("insert into t values(%v, %v, %v)", j, j, j))
+		}
+	}
+	result := tk.MustQuery("select * from t order by c1")
+	for i := 0; i < 1024; i++ {
+		c.Assert(result.Rows()[i][0].(string), Equals, fmt.Sprint(i))
+		c.Assert(result.Rows()[i][1].(string), Equals, fmt.Sprint(i))
+		c.Assert(result.Rows()[i][2].(string), Equals, fmt.Sprint(i))
+	}
 }

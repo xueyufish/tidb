@@ -39,7 +39,7 @@ func (t *mockTxn) String() string {
 	return ""
 }
 
-func (t *mockTxn) LockKeys(_ context.Context, _ uint64, _ ...Key) error {
+func (t *mockTxn) LockKeys(_ context.Context, _ *LockCtx, _ ...Key) error {
 	return nil
 }
 
@@ -112,9 +112,6 @@ func (t *mockTxn) Reset() {
 func (t *mockTxn) SetVars(vars *Variables) {
 
 }
-
-func (t *mockTxn) SetAssertion(key Key, assertion AssertionType) {}
-func (t *mockTxn) ConfirmAssertions(succ bool)                   {}
 
 // NewMockTxn new a mockTxn.
 func NewMockTxn() Transaction {
@@ -208,7 +205,7 @@ func (s *mockSnapshot) SetPriority(priority int) {
 }
 
 func (s *mockSnapshot) BatchGet(ctx context.Context, keys []Key) (map[string][]byte, error) {
-	m := make(map[string][]byte)
+	m := make(map[string][]byte, len(keys))
 	for _, k := range keys {
 		v, err := s.store.Get(ctx, k)
 		if IsErrNotFound(err) {

@@ -78,22 +78,28 @@ func New(fields []*types.FieldType, cap, maxChunkSize int) *Chunk {
 	return chk
 }
 
+// renewWithCapacity creates a new Chunk based on an existing Chunk with capacity. The newly
+// created Chunk has the same data schema with the old Chunk.
+func renewWithCapacity(chk *Chunk, cap, maxChunkSize int) *Chunk {
+	newChk := new(Chunk)
+	if chk.columns == nil {
+		return newChk
+	}
+	newChk.columns = renewColumns(chk.columns, cap)
+	newChk.numVirtualRows = 0
+	newChk.capacity = cap
+	newChk.requiredRows = maxChunkSize
+	return newChk
+}
+
 // Renew creates a new Chunk based on an existing Chunk. The newly created Chunk
 // has the same data schema with the old Chunk. The capacity of the new Chunk
 // might be doubled based on the capacity of the old Chunk and the maxChunkSize.
 //  chk: old chunk(often used in previous call).
 //  maxChunkSize: the limit for the max number of rows.
 func Renew(chk *Chunk, maxChunkSize int) *Chunk {
-	newChk := new(Chunk)
-	if chk.columns == nil {
-		return newChk
-	}
 	newCap := reCalcCapacity(chk, maxChunkSize)
-	newChk.columns = renewColumns(chk.columns, newCap)
-	newChk.numVirtualRows = 0
-	newChk.capacity = newCap
-	newChk.requiredRows = maxChunkSize
-	return newChk
+	return renewWithCapacity(chk, newCap, maxChunkSize)
 }
 
 // renewColumns creates the columns of a Chunk. The capacity of the newly
@@ -104,6 +110,22 @@ func renewColumns(oldCol []*Column, cap int) []*Column {
 		columns = append(columns, newColumn(col.typeSize(), cap))
 	}
 	return columns
+}
+
+// renewEmpty creates a new Chunk based on an existing Chunk
+// but keep columns empty.
+func renewEmpty(chk *Chunk) *Chunk {
+	newChk := &Chunk{
+		columns:        nil,
+		numVirtualRows: chk.numVirtualRows,
+		capacity:       chk.capacity,
+		requiredRows:   chk.requiredRows,
+	}
+	if chk.sel != nil {
+		newChk.sel = make([]int, len(chk.sel))
+		copy(newChk.sel, chk.sel)
+	}
+	return newChk
 }
 
 // MemoryUsage returns the total memory usage of a Chunk in B.
@@ -122,7 +144,7 @@ func newFixedLenColumn(elemLen, cap int) *Column {
 	return &Column{
 		elemBuf:    make([]byte, elemLen),
 		data:       make([]byte, 0, cap*elemLen),
-		nullBitmap: make([]byte, 0, cap>>3),
+		nullBitmap: make([]byte, 0, (cap+7)>>3),
 	}
 }
 
@@ -138,7 +160,7 @@ func newVarLenColumn(cap int, old *Column) *Column {
 	return &Column{
 		offsets:    make([]int64, 1, cap+1),
 		data:       make([]byte, 0, cap*estimatedElemLen),
-		nullBitmap: make([]byte, 0, cap>>3),
+		nullBitmap: make([]byte, 0, (cap+7)>>3),
 	}
 }
 
@@ -159,6 +181,17 @@ func (c *Chunk) SetRequiredRows(requiredRows, maxChunkSize int) *Chunk {
 // IsFull returns if this chunk is considered full.
 func (c *Chunk) IsFull() bool {
 	return c.NumRows() >= c.requiredRows
+}
+
+// Prune creates a new Chunk according to `c` and prunes the columns
+// whose index is not in `usedColIdxs`
+func (c *Chunk) Prune(usedColIdxs []int) *Chunk {
+	chk := renewEmpty(c)
+	chk.columns = make([]*Column, len(usedColIdxs))
+	for i, idx := range usedColIdxs {
+		chk.columns[i] = c.columns[idx]
+	}
+	return chk
 }
 
 // MakeRef makes Column in "dstColIdx" reference to Column in "srcColIdx".
@@ -243,20 +276,17 @@ func (c *Chunk) Reset() {
 		return
 	}
 	for _, col := range c.columns {
-		col.Reset()
+		col.reset()
 	}
 	c.numVirtualRows = 0
 }
 
 // CopyConstruct creates a new chunk and copies this chunk's data into it.
 func (c *Chunk) CopyConstruct() *Chunk {
-	newChk := &Chunk{numVirtualRows: c.numVirtualRows, capacity: c.capacity, columns: make([]*Column, len(c.columns))}
+	newChk := renewEmpty(c)
+	newChk.columns = make([]*Column, len(c.columns))
 	for i := range c.columns {
 		newChk.columns[i] = c.columns[i].CopyConstruct(nil)
-	}
-	if c.sel != nil {
-		newChk.sel = make([]int, len(c.sel))
-		copy(newChk.sel, c.sel)
 	}
 	return newChk
 }
@@ -332,22 +362,54 @@ func (c *Chunk) AppendRow(row Row) {
 }
 
 // AppendPartialRow appends a row to the chunk.
-func (c *Chunk) AppendPartialRow(colIdx int, row Row) {
-	c.appendSel(colIdx)
+func (c *Chunk) AppendPartialRow(colOff int, row Row) {
+	c.appendSel(colOff)
 	for i, rowCol := range row.c.columns {
-		chkCol := c.columns[colIdx+i]
-		chkCol.appendNullBitmap(!rowCol.IsNull(row.idx))
-		if rowCol.isFixed() {
-			elemLen := len(rowCol.elemBuf)
-			offset := row.idx * elemLen
-			chkCol.data = append(chkCol.data, rowCol.data[offset:offset+elemLen]...)
-		} else {
-			start, end := rowCol.offsets[row.idx], rowCol.offsets[row.idx+1]
-			chkCol.data = append(chkCol.data, rowCol.data[start:end]...)
-			chkCol.offsets = append(chkCol.offsets, int64(len(chkCol.data)))
-		}
-		chkCol.length++
+		chkCol := c.columns[colOff+i]
+		appendCellByCell(chkCol, rowCol, row.idx)
 	}
+}
+
+// AppendRowByColIdxs appends a row by its colIdxs to the chunk.
+// 1. every columns are used if colIdxs is nil.
+// 2. no columns are used if colIdxs is not nil but the size of colIdxs is 0.
+func (c *Chunk) AppendRowByColIdxs(row Row, colIdxs []int) (wide int) {
+	wide = c.AppendPartialRowByColIdxs(0, row, colIdxs)
+	c.numVirtualRows++
+	return
+}
+
+// AppendPartialRowByColIdxs appends a row by its colIdxs to the chunk.
+// 1. every columns are used if colIdxs is nil.
+// 2. no columns are used if colIdxs is not nil but the size of colIdxs is 0.
+func (c *Chunk) AppendPartialRowByColIdxs(colOff int, row Row, colIdxs []int) (wide int) {
+	if colIdxs == nil {
+		c.AppendPartialRow(colOff, row)
+		return row.Len()
+	}
+
+	c.appendSel(colOff)
+	for i, colIdx := range colIdxs {
+		rowCol := row.c.columns[colIdx]
+		chkCol := c.columns[colOff+i]
+		appendCellByCell(chkCol, rowCol, row.idx)
+	}
+	return len(colIdxs)
+}
+
+// appendCellByCell appends the cell with rowIdx of src into dst.
+func appendCellByCell(dst *Column, src *Column, rowIdx int) {
+	dst.appendNullBitmap(!src.IsNull(rowIdx))
+	if src.isFixed() {
+		elemLen := len(src.elemBuf)
+		offset := rowIdx * elemLen
+		dst.data = append(dst.data, src.data[offset:offset+elemLen]...)
+	} else {
+		start, end := src.offsets[rowIdx], src.offsets[rowIdx+1]
+		dst.data = append(dst.data, src.data[start:end]...)
+		dst.offsets = append(dst.offsets, int64(len(dst.data)))
+	}
+	dst.length++
 }
 
 // preAlloc pre-allocates the memory space in a Chunk to store the Row.
@@ -601,6 +663,16 @@ func (c *Chunk) AppendDatum(colIdx int, d *types.Datum) {
 // Column returns the specific column.
 func (c *Chunk) Column(colIdx int) *Column {
 	return c.columns[colIdx]
+}
+
+// SetCol sets the colIdx Column to col and returns the old Column.
+func (c *Chunk) SetCol(colIdx int, col *Column) *Column {
+	if col == c.columns[colIdx] {
+		return nil
+	}
+	old := c.columns[colIdx]
+	c.columns[colIdx] = col
+	return old
 }
 
 // Sel returns Sel of this Chunk.

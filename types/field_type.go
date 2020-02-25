@@ -24,9 +24,10 @@ import (
 )
 
 // UnspecifiedLength is unspecified length.
-const (
-	UnspecifiedLength = -1
-)
+const UnspecifiedLength = -1
+
+// ErrorLength is error length for blob or text.
+const ErrorLength = 0
 
 // FieldType records field type information.
 type FieldType = ast.FieldType
@@ -183,6 +184,12 @@ func DefaultTypeForValue(value interface{}, tp *FieldType) {
 		tp.Flen = len(x)
 		tp.Decimal = UnspecifiedLength
 		tp.Charset, tp.Collate = charset.GetDefaultCharsetAndCollate()
+	case float32:
+		tp.Tp = mysql.TypeFloat
+		s := strconv.FormatFloat(float64(x), 'f', -1, 32)
+		tp.Flen = len(s)
+		tp.Decimal = UnspecifiedLength
+		SetBinChsClnFlag(tp)
 	case float64:
 		tp.Tp = mysql.TypeDouble
 		s := strconv.FormatFloat(x, 'f', -1, 64)
@@ -201,7 +208,7 @@ func DefaultTypeForValue(value interface{}, tp *FieldType) {
 		SetBinChsClnFlag(tp)
 	case HexLiteral:
 		tp.Tp = mysql.TypeVarString
-		tp.Flen = len(x)
+		tp.Flen = len(x) * 3
 		tp.Decimal = 0
 		tp.Flag |= mysql.UnsignedFlag
 		SetBinChsClnFlag(tp)
@@ -213,17 +220,17 @@ func DefaultTypeForValue(value interface{}, tp *FieldType) {
 		tp.Flag &= ^mysql.BinaryFlag
 		tp.Flag |= mysql.UnsignedFlag
 	case Time:
-		tp.Tp = x.Type
-		switch x.Type {
+		tp.Tp = x.Type()
+		switch x.Type() {
 		case mysql.TypeDate:
 			tp.Flen = mysql.MaxDateWidth
 			tp.Decimal = UnspecifiedLength
 		case mysql.TypeDatetime, mysql.TypeTimestamp:
 			tp.Flen = mysql.MaxDatetimeWidthNoFsp
-			if x.Fsp > DefaultFsp { // consider point('.') and the fractional part.
-				tp.Flen += int(x.Fsp) + 1
+			if x.Fsp() > DefaultFsp { // consider point('.') and the fractional part.
+				tp.Flen += int(x.Fsp()) + 1
 			}
-			tp.Decimal = int(x.Fsp)
+			tp.Decimal = int(x.Fsp())
 		}
 		SetBinChsClnFlag(tp)
 	case Duration:

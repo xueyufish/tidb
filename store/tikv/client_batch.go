@@ -32,35 +32,43 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 )
 
 type batchConn struct {
+	// An atomic flag indicates whether the batch is die or not.
+	// 0 for busy, others for die.
+	die uint32
+
 	// batchCommandsCh used for batch commands.
 	batchCommandsCh        chan *batchCommandsEntry
 	batchCommandsClients   []*batchCommandsClient
 	tikvTransportLayerLoad uint64
 	closed                 chan struct{}
 
-	// Notify rpcClient to check the idle flag
-	idleNotify *uint32
+	// Notify rpcClient to check the die flag
+	dieNotify  *uint32
 	idleDetect *time.Timer
 
 	pendingRequests prometheus.Gauge
 
 	index uint32
-	idle  bool
 }
 
-func newBatchConn(connCount, maxBatchSize uint, idleNotify *uint32) *batchConn {
+func newBatchConn(connCount, maxBatchSize uint, dieNotify *uint32) *batchConn {
 	return &batchConn{
 		batchCommandsCh:        make(chan *batchCommandsEntry, maxBatchSize),
 		batchCommandsClients:   make([]*batchCommandsClient, 0, connCount),
 		tikvTransportLayerLoad: 0,
 		closed:                 make(chan struct{}),
 
-		idleNotify: idleNotify,
+		dieNotify:  dieNotify,
 		idleDetect: time.NewTimer(idleTimeout),
 	}
+}
+
+func (a *batchConn) isDie() bool {
+	return atomic.LoadUint32(&a.die) != 0
 }
 
 // fetchAllPendingRequests fetches all pending requests from the channel.
@@ -79,9 +87,17 @@ func (a *batchConn) fetchAllPendingRequests(
 		a.idleDetect.Reset(idleTimeout)
 	case <-a.idleDetect.C:
 		a.idleDetect.Reset(idleTimeout)
-		a.idle = true
-		atomic.CompareAndSwapUint32(a.idleNotify, 0, 1)
-		// This batchConn to be recycled
+		// send store heartbeat
+		heartBeatEntry := &batchCommandsEntry{
+			ctx:       context.Background(),
+			req:       tikvrpc.NewRequest(tikvrpc.CmdEmpty, &tikvpb.BatchCommandsEmptyRequest{}).ToBatchCommandsRequest(),
+			res:       make(chan *tikvpb.BatchCommandsResponse_Response, 1),
+			canceled:  0,
+			err:       nil,
+			heartbeat: true,
+		}
+		*entries = append(*entries, heartBeatEntry)
+		*requests = append(*requests, heartBeatEntry.req)
 		return
 	case <-a.closed:
 		return
@@ -193,10 +209,16 @@ type batchCommandsClient struct {
 	batched sync.Map
 	idAlloc uint64
 
+	tikvClientCfg config.TiKVClient
+	tikvLoad      *uint64
+
 	// closed indicates the batch client is closed explicitly or not.
 	closed int32
 	// tryLock protects client when re-create the streaming.
 	tryLock
+
+	dieNotify *uint32
+	dieFlag   *uint32
 }
 
 func (c *batchCommandsClient) isStopped() bool {
@@ -207,14 +229,32 @@ func (c *batchCommandsClient) send(request *tikvpb.BatchCommandsRequest, entries
 	for i, requestID := range request.RequestIds {
 		c.batched.Store(requestID, entries[i])
 	}
-	if err := c.client.Send(request); err != nil {
-		logutil.BgLogger().Error(
-			"batch commands send error",
+
+	if err := c.initBatchClient(); err != nil {
+		logutil.BgLogger().Warn(
+			"init create streaming fail",
 			zap.String("target", c.target),
 			zap.Error(err),
 		)
 		c.failPendingRequests(err)
+		return
 	}
+	if len(entries) == 1 {
+		failpoint.InjectContext(entries[0].ctx, "failBeforeSend", func() {
+			c.failPendingRequests(errors.New("test err"))
+			failpoint.Return()
+		})
+	}
+	if err := c.client.Send(request); err != nil {
+		logutil.BgLogger().Info(
+			"sending batch commands meets error",
+			zap.String("target", c.target),
+			zap.Error(err),
+		)
+		c.failPendingRequests(err)
+		return
+	}
+	return
 }
 
 func (c *batchCommandsClient) recv() (*tikvpb.BatchCommandsResponse, error) {
@@ -228,32 +268,61 @@ func (c *batchCommandsClient) recv() (*tikvpb.BatchCommandsResponse, error) {
 // `failPendingRequests` must be called in locked contexts in order to avoid double closing channels.
 func (c *batchCommandsClient) failPendingRequests(err error) {
 	failpoint.Inject("panicInFailPendingRequests", nil)
+	var heartbeatFail bool
 	c.batched.Range(func(key, value interface{}) bool {
 		id, _ := key.(uint64)
 		entry, _ := value.(*batchCommandsEntry)
 		entry.err = err
 		c.batched.Delete(id)
 		close(entry.res)
+		if entry.heartbeat {
+			heartbeatFail = true
+		}
 		return true
 	})
+	if heartbeatFail {
+		atomic.AddUint32(c.dieFlag, 1)
+		atomic.CompareAndSwapUint32(c.dieNotify, 0, 1)
+	}
+	return
 }
 
-func (c *batchCommandsClient) reCreateStreamingClientOnce(err error) error {
-	c.failPendingRequests(err) // fail all pending requests.
-
-	// Re-establish a application layer stream. TCP layer is handled by gRPC.
-	tikvClient := tikvpb.NewTikvClient(c.conn)
-	streamClient, err := tikvClient.BatchCommands(context.TODO())
-	if err == nil {
-		logutil.BgLogger().Info(
-			"batchRecvLoop re-create streaming success",
-			zap.String("target", c.target),
-		)
-		c.client = streamClient
-
-		return nil
+func (c *batchCommandsClient) waitConnReady() (err error) {
+	dialCtx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	for {
+		s := c.conn.GetState()
+		if s == connectivity.Ready {
+			cancel()
+			break
+		}
+		if !c.conn.WaitForStateChange(dialCtx, s) {
+			cancel()
+			err = dialCtx.Err()
+			return
+		}
 	}
-	logutil.BgLogger().Error(
+	return
+}
+
+func (c *batchCommandsClient) reCreateStreamingClientOnce(perr error) error {
+	c.failPendingRequests(perr) // fail all pending requests.
+
+	err := c.waitConnReady()
+	// Re-establish a application layer stream. TCP layer is handled by gRPC.
+	if err == nil {
+		tikvClient := tikvpb.NewTikvClient(c.conn)
+		var streamClient tikvpb.Tikv_BatchCommandsClient
+		streamClient, err = tikvClient.BatchCommands(context.TODO())
+		if err == nil {
+			logutil.BgLogger().Info(
+				"batchRecvLoop re-create streaming success",
+				zap.String("target", c.target),
+			)
+			c.client = streamClient
+			return nil
+		}
+	}
+	logutil.BgLogger().Info(
 		"batchRecvLoop re-create streaming fail",
 		zap.String("target", c.target),
 		zap.Error(err),
@@ -276,8 +345,11 @@ func (c *batchCommandsClient) batchRecvLoop(cfg config.TiKVClient, tikvTransport
 	for {
 		resp, err := c.recv()
 		if err != nil {
-			logutil.BgLogger().Error(
-				"batchRecvLoop error when receive",
+			if c.isStopped() {
+				return
+			}
+			logutil.BgLogger().Info(
+				"batchRecvLoop fails when receiving, needs to reconnect",
 				zap.String("target", c.target),
 				zap.Error(err),
 			)
@@ -301,7 +373,12 @@ func (c *batchCommandsClient) batchRecvLoop(cfg config.TiKVClient, tikvTransport
 			}
 			entry := value.(*batchCommandsEntry)
 			logutil.Eventf(entry.ctx, "receive %T response with other %d batched requests from %s", responses[i].GetCmd(), len(responses), c.target)
-			if atomic.LoadInt32(&entry.canceled) == 0 {
+			failpoint.InjectContext(entry.ctx, "forceReturnIdleHeartbeatResp", func() {
+				if entry.heartbeat {
+					entry.res <- responses[i]
+				}
+			})
+			if atomic.LoadInt32(&entry.canceled) == 0 && !entry.heartbeat {
 				// Put the response only if the request is not canceled.
 				entry.res <- responses[i]
 			}
@@ -345,15 +422,32 @@ type batchCommandsEntry struct {
 	res chan *tikvpb.BatchCommandsResponse_Response
 
 	// canceled indicated the request is canceled or not.
-	canceled int32
-	err      error
+	canceled  int32
+	err       error
+	heartbeat bool
 }
 
 func (b *batchCommandsEntry) isCanceled() bool {
 	return atomic.LoadInt32(&b.canceled) == 1
 }
 
-const idleTimeout = 3 * time.Minute
+const idleTimeout = 1 * time.Minute
+
+func resetEntries(entries []*batchCommandsEntry) []*batchCommandsEntry {
+	for i := 0; i < len(entries); i++ {
+		entries[i] = nil
+	}
+	entries = entries[:0]
+	return entries
+}
+
+func resetRequests(requests []*tikvpb.BatchCommandsRequest_Request) []*tikvpb.BatchCommandsRequest_Request {
+	for i := 0; i < len(requests); i++ {
+		requests[i] = nil
+	}
+	requests = requests[:0]
+	return requests
+}
 
 func (a *batchConn) batchSendLoop(cfg config.TiKVClient) {
 	defer func() {
@@ -373,8 +467,12 @@ func (a *batchConn) batchSendLoop(cfg config.TiKVClient) {
 
 	var bestBatchWaitSize = cfg.BatchWaitSize
 	for {
-		entries = entries[:0]
-		requests = requests[:0]
+		// NOTE: We can't simply set entries = entries[:0] here.
+		// The data in the cap part of the slice would reference the prewrite keys whose
+		// underlying memory is borrowed from memdb. The reference cause GC can't release
+		// the memdb, leading to serious memory leak problems in the large transaction case.
+		entries = resetEntries(entries)
+		requests = resetRequests(requests)
 		requestIDs = requestIDs[:0]
 
 		a.pendingRequests.Set(float64(len(a.batchCommandsCh)))
@@ -395,9 +493,9 @@ func (a *batchConn) batchSendLoop(cfg config.TiKVClient) {
 			return
 		} else if uint(length) < bestBatchWaitSize && bestBatchWaitSize > 1 {
 			// Waits too long to collect requests, reduce the target batch size.
-			bestBatchWaitSize -= 1
+			bestBatchWaitSize--
 		} else if uint(length) > bestBatchWaitSize+4 && bestBatchWaitSize < cfg.MaxBatchSize {
-			bestBatchWaitSize += 1
+			bestBatchWaitSize++
 		}
 
 		entries, requests = removeCanceledRequests(entries, requests)
@@ -411,8 +509,10 @@ func (a *batchConn) batchSendLoop(cfg config.TiKVClient) {
 
 func (a *batchConn) getClientAndSend(entries []*batchCommandsEntry, requests []*tikvpb.BatchCommandsRequest_Request, requestIDs []uint64) {
 	// Choose a connection by round-robbin.
-	var cli *batchCommandsClient = nil
-	var target string = ""
+	var (
+		cli    *batchCommandsClient
+		target string
+	)
 	for i := 0; i < len(a.batchCommandsClients); i++ {
 		a.index = (a.index + 1) % uint32(len(a.batchCommandsClients))
 		target = a.batchCommandsClients[a.index].target
@@ -422,12 +522,25 @@ func (a *batchConn) getClientAndSend(entries []*batchCommandsEntry, requests []*
 			break
 		}
 	}
+	if len(entries) == 1 {
+		failpoint.InjectContext(entries[0].ctx, "noAvConn", func() {
+			cli = nil
+		})
+	}
 	if cli == nil {
 		logutil.BgLogger().Warn("no available connections", zap.String("target", target))
+		var heartbeatFail bool
 		for _, entry := range entries {
 			// Please ensure the error is handled in region cache correctly.
 			entry.err = errors.New("no available connections")
 			close(entry.res)
+			if entry.heartbeat {
+				heartbeatFail = true
+			}
+		}
+		if heartbeatFail {
+			atomic.AddUint32(&a.die, 1)
+			atomic.CompareAndSwapUint32(a.dieNotify, 0, 1)
 		}
 		return
 	}
@@ -444,7 +557,26 @@ func (a *batchConn) getClientAndSend(entries []*batchCommandsEntry, requests []*
 	}
 
 	cli.send(req, entries)
-	return
+}
+
+func (c *batchCommandsClient) initBatchClient() error {
+	if c.client != nil {
+		return nil
+	}
+
+	if err := c.waitConnReady(); err != nil {
+		return err
+	}
+
+	// Initialize batch streaming clients.
+	tikvClient := tikvpb.NewTikvClient(c.conn)
+	streamClient, err := tikvClient.BatchCommands(context.TODO())
+	if err != nil {
+		return errors.Trace(err)
+	}
+	c.client = streamClient
+	go c.batchRecvLoop(c.tikvClientCfg, c.tikvLoad)
+	return nil
 }
 
 func (a *batchConn) Close() {
@@ -463,14 +595,14 @@ func (a *batchConn) Close() {
 func removeCanceledRequests(entries []*batchCommandsEntry,
 	requests []*tikvpb.BatchCommandsRequest_Request) ([]*batchCommandsEntry, []*tikvpb.BatchCommandsRequest_Request) {
 	validEntries := entries[:0]
-	validRequets := requests[:0]
+	validRequests := requests[:0]
 	for _, e := range entries {
 		if !e.isCanceled() {
 			validEntries = append(validEntries, e)
-			validRequets = append(validRequets, e.req)
+			validRequests = append(validRequests, e.req)
 		}
 	}
-	return validEntries, validRequets
+	return validEntries, validRequests
 }
 
 func sendBatchRequest(
@@ -487,6 +619,9 @@ func sendBatchRequest(
 		canceled: 0,
 		err:      nil,
 	}
+	failpoint.InjectContext(ctx, "sendIdleHeartbeatReq", func() {
+		entry.heartbeat = true
+	})
 	ctx1, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	select {
@@ -502,7 +637,7 @@ func sendBatchRequest(
 		if !ok {
 			return nil, errors.Trace(entry.err)
 		}
-		return tikvrpc.FromBatchCommandsResponse(res), nil
+		return tikvrpc.FromBatchCommandsResponse(res)
 	case <-ctx1.Done():
 		atomic.StoreInt32(&entry.canceled, 1)
 		logutil.BgLogger().Warn("wait response is cancelled",
@@ -511,22 +646,26 @@ func sendBatchRequest(
 	}
 }
 
-func (c *rpcClient) recycleIdleConnArray() {
+func (c *rpcClient) recycleDieConnArray() {
 	var addrs []string
 	c.RLock()
 	for _, conn := range c.conns {
-		if conn.idle {
+		if conn.isDie() {
 			addrs = append(addrs, conn.target)
 		}
 	}
 	c.RUnlock()
+
+	if c.dieEventListener != nil {
+		c.dieEventListener(addrs)
+	}
 
 	for _, addr := range addrs {
 		c.Lock()
 		conn, ok := c.conns[addr]
 		if ok {
 			delete(c.conns, addr)
-			logutil.BgLogger().Info("recycle idle connection",
+			logutil.BgLogger().Info("recycle die connection",
 				zap.String("target", addr))
 		}
 		c.Unlock()

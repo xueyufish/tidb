@@ -14,6 +14,7 @@
 package core_test
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"strings"
@@ -22,13 +23,16 @@ import (
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/metrics"
+	"github.com/pingcap/tidb/planner"
 	"github.com/pingcap/tidb/planner/core"
+	"github.com/pingcap/tidb/session"
+	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/util/testkit"
 	"github.com/pingcap/tidb/util/testleak"
 	dto "github.com/prometheus/client_model/go"
 )
 
-var _ = Suite(&testPointGetSuite{})
+var _ = SerialSuites(&testPointGetSuite{})
 
 type testPointGetSuite struct {
 	store kv.Storage
@@ -78,13 +82,16 @@ func (s *testPointGetSuite) TestPointGetPlanCache(c *C) {
 		"Point_Get_1 1.00 root table:t, handle:1",
 	))
 	tk.MustQuery("explain update t set b=b+1, c=c+1 where a = 1").Check(testkit.Rows(
-		"Point_Get_1 1.00 root table:t, handle:1",
+		"Update_2 N/A root N/A",
+		"└─Point_Get_1 1.00 root table:t, handle:1",
 	))
 	tk.MustQuery("explain delete from t where a = 1").Check(testkit.Rows(
-		"Point_Get_1 1.00 root table:t, handle:1",
+		"Delete_2 N/A root N/A",
+		"└─Point_Get_1 1.00 root table:t, handle:1",
 	))
 	tk.MustQuery("explain select a from t where a = -1").Check(testkit.Rows(
-		"TableDual_5 0.00 root rows:0"))
+		"TableDual_5 0.00 root rows:0",
+	))
 	tk.MustExec(`prepare stmt0 from "select a from t where a = ?"`)
 	tk.MustExec("set @p0 = -1")
 	tk.MustQuery("execute stmt0 using @p0").Check(testkit.Rows())
@@ -194,4 +201,137 @@ func checkUseForUpdate(tk *testkit.TestKit, c *C, expectLock bool) {
 	c.Assert(selectLock, Equals, expectLock)
 
 	tk.MustQuery("select * from fu where id = 6 for update").Check(testkit.Rows("6 6"))
+}
+
+func (s *testPointGetSuite) TestWhereIn2BatchPointGet(c *C) {
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t(a int primary key auto_increment not null, b int, c int, unique key idx_abc(a, b, c))")
+	tk.MustExec("insert into t values(1, 1, 1), (2, 2, 2), (3, 3, 3), (4, 4, 5)")
+	tk.MustQuery("select * from t").Check(testkit.Rows(
+		"1 1 1",
+		"2 2 2",
+		"3 3 3",
+		"4 4 5",
+	))
+	tk.MustQuery("explain select * from t where a = 1 and b = 1 and c = 1").Check(testkit.Rows(
+		"Point_Get_1 1.00 root table:t, index:a b c",
+	))
+	tk.MustQuery("explain select * from t where 1 = a and 1 = b and 1 = c").Check(testkit.Rows(
+		"Point_Get_1 1.00 root table:t, index:a b c",
+	))
+	tk.MustQuery("explain select * from t where 1 = a and b = 1 and 1 = c").Check(testkit.Rows(
+		"Point_Get_1 1.00 root table:t, index:a b c",
+	))
+	tk.MustQuery("explain select * from t where (a, b, c) in ((1, 1, 1), (2, 2, 2))").Check(testkit.Rows(
+		"Batch_Point_Get_1 2.00 root table:t, index:a b c",
+	))
+
+	tk.MustQuery("explain select * from t where a in (1, 2, 3, 4, 5)").Check(testkit.Rows(
+		"Batch_Point_Get_1 5.00 root table:t",
+	))
+
+	tk.MustQuery("explain select * from t where a in (1, 2, 3, 1, 2)").Check(testkit.Rows(
+		"Batch_Point_Get_1 5.00 root table:t",
+	))
+
+	tk.MustQuery("explain select * from t where (a) in ((1), (2), (3), (1), (2))").Check(testkit.Rows(
+		"Batch_Point_Get_1 5.00 root table:t",
+	))
+
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t(a int, b int, c int, unique key idx_ab(a, b))")
+	tk.MustExec("insert into t values(1, 2, 3), (2, 3, 4), (3, 4, 5), (4, 5, 6)")
+	tk.MustQuery("select * from t").Check(testkit.Rows(
+		"1 2 3",
+		"2 3 4",
+		"3 4 5",
+		"4 5 6",
+	))
+	tk.MustQuery("explain select * from t where (a, b) in ((1, 2), (2, 3))").Check(testkit.Rows(
+		"Batch_Point_Get_1 2.00 root table:t, index:a b",
+	))
+	tk.MustQuery("select * from t where (a, b) in ((1, 2), (2, 3))").Check(testkit.Rows(
+		"1 2 3",
+		"2 3 4",
+	))
+	tk.MustQuery("select * from t where (b, a) in ((1, 2), (2, 3))").Check(testkit.Rows())
+	tk.MustQuery("select * from t where (b, a) in ((2, 1), (3, 2))").Check(testkit.Rows(
+		"1 2 3",
+		"2 3 4",
+	))
+	tk.MustQuery("select * from t where (b, a) in ((2, 1), (3, 2), (2, 1), (5, 4))").Check(testkit.Rows(
+		"1 2 3",
+		"2 3 4",
+		"4 5 6",
+	))
+	tk.MustQuery("select * from t where (b, a) in ((2, 1), (3, 2), (2, 1), (5, 4), (3, 4))").Check(testkit.Rows(
+		"1 2 3",
+		"2 3 4",
+		"4 5 6",
+	))
+}
+
+// Test that the plan id will be reset before optimization every time.
+func (s *testPointGetSuite) TestPointGetId(c *C) {
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t (c1 int primary key, c2 int)")
+	defer tk.MustExec("drop table if exists t")
+	pointGetQuery := "select c2 from t where c1 = 1"
+	for i := 0; i < 2; i++ {
+		ctx := tk.Se.(sessionctx.Context)
+		stmts, err := session.Parse(ctx, pointGetQuery)
+		c.Assert(err, IsNil)
+		c.Assert(stmts, HasLen, 1)
+		stmt := stmts[0]
+		is := domain.GetDomain(ctx).InfoSchema()
+		err = core.Preprocess(ctx, stmt, is)
+		c.Assert(err, IsNil)
+		p, _, err := planner.Optimize(context.TODO(), ctx, stmt, is)
+		c.Assert(err, IsNil)
+		// Test explain result is useless, plan id will be reset when running `explain`.
+		c.Assert(p.ID(), Equals, 1)
+	}
+}
+
+func (s *testPointGetSuite) TestBatchPointGetPlanCache(c *C) {
+	tk := testkit.NewTestKit(c, s.store)
+	orgEnable := core.PreparedPlanCacheEnabled()
+	orgCapacity := core.PreparedPlanCacheCapacity
+	orgMemGuardRatio := core.PreparedPlanCacheMemoryGuardRatio
+	orgMaxMemory := core.PreparedPlanCacheMaxMemory
+	defer func() {
+		core.SetPreparedPlanCache(orgEnable)
+		core.PreparedPlanCacheCapacity = orgCapacity
+		core.PreparedPlanCacheMemoryGuardRatio = orgMemGuardRatio
+		core.PreparedPlanCacheMaxMemory = orgMaxMemory
+	}()
+	core.SetPreparedPlanCache(true)
+	core.PreparedPlanCacheCapacity = 100
+	core.PreparedPlanCacheMemoryGuardRatio = 0.1
+	// PreparedPlanCacheMaxMemory is set to MAX_UINT64 to make sure the cache
+	// behavior would not be effected by the uncertain memory utilization.
+	core.PreparedPlanCacheMaxMemory.Store(math.MaxUint64)
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t(a int primary key, b int)")
+	tk.MustExec("insert into t values(1, 1), (2, 2), (3, 3), (4, 4)")
+	tk.MustQuery("explain select * from t where a in (1, 2)").Check(testkit.Rows(
+		"Batch_Point_Get_1 2.00 root table:t",
+	))
+	tk.MustExec("prepare stmt from 'select * from t where a in (?,?)'")
+	tk.MustExec("set @p1 = 1, @p2 = 2")
+	tk.MustQuery("execute stmt using @p1, @p2;").Check(testkit.Rows(
+		"1 1",
+		"2 2",
+	))
+	tk.MustExec("set @p1 = 3, @p2 = 4")
+	tk.MustQuery("execute stmt using @p1, @p2;").Check(testkit.Rows(
+		"3 3",
+		"4 4",
+	))
 }

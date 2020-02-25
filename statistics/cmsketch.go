@@ -15,7 +15,6 @@ package statistics
 
 import (
 	"bytes"
-	"fmt"
 	"math"
 	"reflect"
 	"sort"
@@ -26,8 +25,8 @@ import (
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/hack"
-	"github.com/pingcap/tidb/util/sqlexec"
 	"github.com/pingcap/tipb/go-tipb"
 	"github.com/spaolacci/murmur3"
 )
@@ -65,32 +64,27 @@ func NewCMSketch(d, w int32) *CMSketch {
 // topNHelper wraps some variables used when building cmsketch with top n.
 type topNHelper struct {
 	sampleSize    uint64
-	counter       map[hack.MutableString]uint64
-	sorted        []uint64
+	sorted        []dataCnt
 	onlyOnceItems uint64
 	sumTopN       uint64
-	lastVal       uint64
+	actualNumTop  uint32
 }
 
 func newTopNHelper(sample [][]byte, numTop uint32) *topNHelper {
-	counter := make(map[hack.MutableString]uint64)
+	counter := make(map[hack.MutableString]uint64, len(sample))
 	for i := range sample {
 		counter[hack.String(sample[i])]++
 	}
-	sorted, onlyOnceItems := make([]uint64, 0, len(counter)), uint64(0)
-	for _, cnt := range counter {
-		sorted = append(sorted, cnt)
+	sorted, onlyOnceItems := make([]dataCnt, 0, len(counter)), uint64(0)
+	for key, cnt := range counter {
+		sorted = append(sorted, dataCnt{hack.Slice(string(key)), cnt})
 		if cnt == 1 {
 			onlyOnceItems++
 		}
 	}
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i] > sorted[j]
-	})
+	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].cnt > sorted[j].cnt })
 
 	var (
-		// last is the last element in top N index should occurres atleast `last` times.
-		last      uint64
 		sumTopN   uint64
 		sampleNDV = uint32(len(sorted))
 	)
@@ -99,22 +93,25 @@ func newTopNHelper(sample [][]byte, numTop uint32) *topNHelper {
 	// frequency of the n-th element are added to the TopN statistics. We chose
 	// 2/3 as an empirical value because the average cardinality estimation
 	// error is relatively small compared with 1/2.
-	for i := uint32(0); i < sampleNDV && i < numTop*2; i++ {
-		if i >= numTop && sorted[i]*3 < sorted[numTop-1]*2 && last != sorted[i] {
+	var actualNumTop uint32
+	for ; actualNumTop < sampleNDV && actualNumTop < numTop*2; actualNumTop++ {
+		if actualNumTop >= numTop && sorted[actualNumTop].cnt*3 < sorted[numTop-1].cnt*2 {
 			break
 		}
-		if sorted[i] == 1 {
+		if sorted[actualNumTop].cnt == 1 {
 			break
 		}
-		last = sorted[i]
-		sumTopN += sorted[i]
+		sumTopN += sorted[actualNumTop].cnt
 	}
 
-	return &topNHelper{uint64(len(sample)), counter, sorted, onlyOnceItems, sumTopN, last}
+	return &topNHelper{uint64(len(sample)), sorted, onlyOnceItems, sumTopN, actualNumTop}
 }
 
 // NewCMSketchWithTopN returns a new CM sketch with TopN elements, the estimate NDV and the scale ratio.
 func NewCMSketchWithTopN(d, w int32, sample [][]byte, numTop uint32, rowCount uint64) (*CMSketch, uint64, uint64) {
+	if rowCount == 0 || len(sample) == 0 {
+		return nil, 0, 0
+	}
 	helper := newTopNHelper(sample, numTop)
 	// rowCount is not a accurate value when fast analyzing
 	// In some cases, if user triggers fast analyze when rowCount is close to sampleSize, unexpected bahavior might happen.
@@ -129,23 +126,24 @@ func buildCMSWithTopN(helper *topNHelper, d, w int32, scaleRatio uint64, default
 	c = NewCMSketch(d, w)
 	enableTopN := helper.sampleSize/topNThreshold <= helper.sumTopN
 	if enableTopN {
-		c.topN = make(map[uint64][]*TopNMeta)
+		c.topN = make(map[uint64][]*TopNMeta, helper.actualNumTop)
+		for i := uint32(0); i < helper.actualNumTop; i++ {
+			data, cnt := helper.sorted[i].data, helper.sorted[i].cnt
+			h1, h2 := murmur3.Sum128(data)
+			c.topN[h1] = append(c.topN[h1], &TopNMeta{h2, data, cnt * scaleRatio})
+		}
+		helper.sorted = helper.sorted[helper.actualNumTop:]
 	}
 	c.defaultValue = defaultVal
-	for counterKey, cnt := range helper.counter {
-		data := hack.Slice(string(counterKey))
+	for i := range helper.sorted {
+		data, cnt := helper.sorted[i].data, helper.sorted[i].cnt
 		// If the value only occurred once in the sample, we assumes that there is no difference with
 		// value that does not occurred in the sample.
 		rowCount := defaultVal
 		if cnt > 1 {
 			rowCount = cnt * scaleRatio
 		}
-		if enableTopN && cnt >= helper.lastVal {
-			h1, h2 := murmur3.Sum128(data)
-			c.topN[h1] = append(c.topN[h1], &TopNMeta{h2, data, rowCount})
-		} else {
-			c.insertBytesByCount(data, rowCount)
-		}
+		c.insertBytesByCount(data, rowCount)
 	}
 	return
 }
@@ -337,6 +335,9 @@ func (c *CMSketch) mergeTopN(lTopN map[uint64][]*TopNMeta, rTopN map[uint64][]*T
 
 // MergeCMSketch merges two CM Sketch.
 func (c *CMSketch) MergeCMSketch(rc *CMSketch, numTopN uint32) error {
+	if c == nil || rc == nil {
+		return nil
+	}
 	if c.depth != rc.depth || c.width != rc.width {
 		return errors.New("Dimensions of Count-Min Sketch should be the same")
 	}
@@ -397,7 +398,7 @@ func CMSketchToProto(c *CMSketch) *tipb.CMSketch {
 
 // CMSketchFromProto converts CMSketch from its protobuf representation.
 func CMSketchFromProto(protoSketch *tipb.CMSketch) *CMSketch {
-	if protoSketch == nil {
+	if protoSketch == nil || len(protoSketch.Rows) == 0 {
 		return nil
 	}
 	c := NewCMSketch(int32(len(protoSketch.Rows)), int32(len(protoSketch.Rows[0].Counters)))
@@ -412,7 +413,7 @@ func CMSketchFromProto(protoSketch *tipb.CMSketch) *CMSketch {
 	if len(protoSketch.TopN) == 0 {
 		return c
 	}
-	c.topN = make(map[uint64][]*TopNMeta)
+	c.topN = make(map[uint64][]*TopNMeta, len(protoSketch.TopN))
 	for _, e := range protoSketch.TopN {
 		h1, h2 := murmur3.Sum128(e.Data)
 		c.topN[h1] = append(c.topN[h1], &TopNMeta{h2, e.Data, e.Count})
@@ -432,8 +433,8 @@ func EncodeCMSketchWithoutTopN(c *CMSketch) ([]byte, error) {
 	return protoData, err
 }
 
-// decodeCMSketch decode a CMSketch from the given byte slice.
-func decodeCMSketch(data []byte, topN []*TopNMeta) (*CMSketch, error) {
+// DecodeCMSketch decode a CMSketch from the given byte slice.
+func DecodeCMSketch(data []byte, topNRows []chunk.Row) (*CMSketch, error) {
 	if data == nil {
 		return nil, nil
 	}
@@ -442,27 +443,12 @@ func decodeCMSketch(data []byte, topN []*TopNMeta) (*CMSketch, error) {
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	if len(p.Rows) == 0 && len(topN) == 0 {
-		return nil, nil
-	}
-	for _, meta := range topN {
-		p.TopN = append(p.TopN, &tipb.CMSketchTopN{Data: meta.Data, Count: meta.Count})
+	for _, row := range topNRows {
+		data := make([]byte, len(row.GetBytes(0)))
+		copy(data, row.GetBytes(0))
+		p.TopN = append(p.TopN, &tipb.CMSketchTopN{Data: data, Count: row.GetUint64(1)})
 	}
 	return CMSketchFromProto(p), nil
-}
-
-// LoadCMSketchWithTopN loads the CM sketch with topN from storage.
-func LoadCMSketchWithTopN(exec sqlexec.RestrictedSQLExecutor, tableID, isIndex, histID int64, cms []byte) (*CMSketch, error) {
-	sql := fmt.Sprintf("select HIGH_PRIORITY value, count from mysql.stats_top_n where table_id = %d and is_index = %d and hist_id = %d", tableID, isIndex, histID)
-	topNRows, _, err := exec.ExecRestrictedSQL(nil, sql)
-	if err != nil {
-		return nil, err
-	}
-	topN := make([]*TopNMeta, 0, len(topNRows))
-	for _, row := range topNRows {
-		topN = append(topN, &TopNMeta{Data: row.GetBytes(0), Count: row.GetUint64(1)})
-	}
-	return decodeCMSketch(cms, topN)
 }
 
 // TotalCount returns the total count in the sketch, it is only used for test.
@@ -493,7 +479,7 @@ func (c *CMSketch) Copy() *CMSketch {
 	}
 	var topN map[uint64][]*TopNMeta
 	if c.topN != nil {
-		topN = make(map[uint64][]*TopNMeta)
+		topN = make(map[uint64][]*TopNMeta, len(c.topN))
 		for h1, vals := range c.topN {
 			newVals := make([]*TopNMeta, 0, len(vals))
 			for _, val := range vals {
@@ -517,6 +503,15 @@ func (c *CMSketch) TopN() []*TopNMeta {
 		topN = append(topN, meta...)
 	}
 	return topN
+}
+
+// AppendTopN appends a topn into the cm sketch.
+func (c *CMSketch) AppendTopN(data []byte, count uint64) {
+	if c.topN == nil {
+		c.topN = make(map[uint64][]*TopNMeta)
+	}
+	h1, h2 := murmur3.Sum128(data)
+	c.topN[h1] = append(c.topN[h1], &TopNMeta{h2, data, count})
 }
 
 // GetWidthAndDepth returns the width and depth of CM Sketch.

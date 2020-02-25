@@ -47,6 +47,8 @@ const (
 	CmdDeleteRange
 	CmdPessimisticLock
 	CmdPessimisticRollback
+	CmdTxnHeartBeat
+	CmdCheckTxnStatus
 
 	CmdRawGet CmdType = 256 + iota
 	CmdRawBatchGet
@@ -58,6 +60,11 @@ const (
 	CmdRawScan
 
 	CmdUnsafeDestroyRange
+
+	CmdRegisterLockObserver
+	CmdCheckLockObserver
+	CmdRemoveLockObserver
+	CmdPhysicalScanLock
 
 	CmdCop CmdType = 512 + iota
 	CmdCopStream
@@ -117,6 +124,14 @@ func (t CmdType) String() string {
 		return "RawScan"
 	case CmdUnsafeDestroyRange:
 		return "UnsafeDestroyRange"
+	case CmdRegisterLockObserver:
+		return "RegisterLockObserver"
+	case CmdCheckLockObserver:
+		return "CheckLockObserver"
+	case CmdRemoveLockObserver:
+		return "RemoveLockObserver"
+	case CmdPhysicalScanLock:
+		return "PhysicalScanLock"
 	case CmdCop:
 		return "Cop"
 	case CmdCopStream:
@@ -127,8 +142,12 @@ func (t CmdType) String() string {
 		return "MvccGetByStartTS"
 	case CmdSplitRegion:
 		return "SplitRegion"
+	case CmdCheckTxnStatus:
+		return "CheckTxnStatus"
 	case CmdDebugGetRegionProperties:
 		return "DebugGetRegionProperties"
+	case CmdTxnHeartBeat:
+		return "TxnHeartBeat"
 	}
 	return "Unknown"
 }
@@ -139,6 +158,7 @@ type Request struct {
 	req  interface{}
 	kvrpcpb.Context
 	ReplicaReadSeed uint32
+	StoreTp         kv.StoreType
 }
 
 // NewRequest returns new kv rpc request.
@@ -264,6 +284,26 @@ func (req *Request) UnsafeDestroyRange() *kvrpcpb.UnsafeDestroyRangeRequest {
 	return req.req.(*kvrpcpb.UnsafeDestroyRangeRequest)
 }
 
+// RegisterLockObserver returns RegisterLockObserverRequest in request.
+func (req *Request) RegisterLockObserver() *kvrpcpb.RegisterLockObserverRequest {
+	return req.req.(*kvrpcpb.RegisterLockObserverRequest)
+}
+
+// CheckLockObserver returns CheckLockObserverRequest in request.
+func (req *Request) CheckLockObserver() *kvrpcpb.CheckLockObserverRequest {
+	return req.req.(*kvrpcpb.CheckLockObserverRequest)
+}
+
+// RemoveLockObserver returns RemoveLockObserverRequest in request.
+func (req *Request) RemoveLockObserver() *kvrpcpb.RemoveLockObserverRequest {
+	return req.req.(*kvrpcpb.RemoveLockObserverRequest)
+}
+
+// PhysicalScanLock returns PhysicalScanLockRequest in request.
+func (req *Request) PhysicalScanLock() *kvrpcpb.PhysicalScanLockRequest {
+	return req.req.(*kvrpcpb.PhysicalScanLockRequest)
+}
+
 // Cop returns coprocessor request in request.
 func (req *Request) Cop() *coprocessor.Request {
 	return req.req.(*coprocessor.Request)
@@ -299,9 +339,19 @@ func (req *Request) DebugGetRegionProperties() *debugpb.GetRegionPropertiesReque
 	return req.req.(*debugpb.GetRegionPropertiesRequest)
 }
 
-// Empty returns BatchCommandsEmptyRequest in request
+// Empty returns BatchCommandsEmptyRequest in request.
 func (req *Request) Empty() *tikvpb.BatchCommandsEmptyRequest {
 	return req.req.(*tikvpb.BatchCommandsEmptyRequest)
+}
+
+// CheckTxnStatus returns CheckTxnStatusRequest in request.
+func (req *Request) CheckTxnStatus() *kvrpcpb.CheckTxnStatusRequest {
+	return req.req.(*kvrpcpb.CheckTxnStatusRequest)
+}
+
+// TxnHeartBeat returns TxnHeartBeatRequest in request.
+func (req *Request) TxnHeartBeat() *kvrpcpb.TxnHeartBeatRequest {
+	return req.req.(*kvrpcpb.TxnHeartBeatRequest)
 }
 
 // ToBatchCommandsRequest converts the request to an entry in BatchCommands request.
@@ -353,6 +403,10 @@ func (req *Request) ToBatchCommandsRequest() *tikvpb.BatchCommandsRequest_Reques
 		return &tikvpb.BatchCommandsRequest_Request{Cmd: &tikvpb.BatchCommandsRequest_Request_PessimisticRollback{PessimisticRollback: req.PessimisticRollback()}}
 	case CmdEmpty:
 		return &tikvpb.BatchCommandsRequest_Request{Cmd: &tikvpb.BatchCommandsRequest_Request_Empty{Empty: req.Empty()}}
+	case CmdCheckTxnStatus:
+		return &tikvpb.BatchCommandsRequest_Request{Cmd: &tikvpb.BatchCommandsRequest_Request_CheckTxnStatus{CheckTxnStatus: req.CheckTxnStatus()}}
+	case CmdTxnHeartBeat:
+		return &tikvpb.BatchCommandsRequest_Request{Cmd: &tikvpb.BatchCommandsRequest_Request_TxnHeartBeat{TxnHeartBeat: req.TxnHeartBeat()}}
 	}
 	return nil
 }
@@ -372,56 +426,63 @@ type Response struct {
 }
 
 // FromBatchCommandsResponse converts a BatchCommands response to Response.
-func FromBatchCommandsResponse(res *tikvpb.BatchCommandsResponse_Response) *Response {
+func FromBatchCommandsResponse(res *tikvpb.BatchCommandsResponse_Response) (*Response, error) {
+	if res.GetCmd() == nil {
+		return nil, errors.New("Unknown command response")
+	}
 	switch res := res.GetCmd().(type) {
 	case *tikvpb.BatchCommandsResponse_Response_Get:
-		return &Response{Resp: res.Get}
+		return &Response{Resp: res.Get}, nil
 	case *tikvpb.BatchCommandsResponse_Response_Scan:
-		return &Response{Resp: res.Scan}
+		return &Response{Resp: res.Scan}, nil
 	case *tikvpb.BatchCommandsResponse_Response_Prewrite:
-		return &Response{Resp: res.Prewrite}
+		return &Response{Resp: res.Prewrite}, nil
 	case *tikvpb.BatchCommandsResponse_Response_Commit:
-		return &Response{Resp: res.Commit}
+		return &Response{Resp: res.Commit}, nil
 	case *tikvpb.BatchCommandsResponse_Response_Cleanup:
-		return &Response{Resp: res.Cleanup}
+		return &Response{Resp: res.Cleanup}, nil
 	case *tikvpb.BatchCommandsResponse_Response_BatchGet:
-		return &Response{Resp: res.BatchGet}
+		return &Response{Resp: res.BatchGet}, nil
 	case *tikvpb.BatchCommandsResponse_Response_BatchRollback:
-		return &Response{Resp: res.BatchRollback}
+		return &Response{Resp: res.BatchRollback}, nil
 	case *tikvpb.BatchCommandsResponse_Response_ScanLock:
-		return &Response{Resp: res.ScanLock}
+		return &Response{Resp: res.ScanLock}, nil
 	case *tikvpb.BatchCommandsResponse_Response_ResolveLock:
-		return &Response{Resp: res.ResolveLock}
+		return &Response{Resp: res.ResolveLock}, nil
 	case *tikvpb.BatchCommandsResponse_Response_GC:
-		return &Response{Resp: res.GC}
+		return &Response{Resp: res.GC}, nil
 	case *tikvpb.BatchCommandsResponse_Response_DeleteRange:
-		return &Response{Resp: res.DeleteRange}
+		return &Response{Resp: res.DeleteRange}, nil
 	case *tikvpb.BatchCommandsResponse_Response_RawGet:
-		return &Response{Resp: res.RawGet}
+		return &Response{Resp: res.RawGet}, nil
 	case *tikvpb.BatchCommandsResponse_Response_RawBatchGet:
-		return &Response{Resp: res.RawBatchGet}
+		return &Response{Resp: res.RawBatchGet}, nil
 	case *tikvpb.BatchCommandsResponse_Response_RawPut:
-		return &Response{Resp: res.RawPut}
+		return &Response{Resp: res.RawPut}, nil
 	case *tikvpb.BatchCommandsResponse_Response_RawBatchPut:
-		return &Response{Resp: res.RawBatchPut}
+		return &Response{Resp: res.RawBatchPut}, nil
 	case *tikvpb.BatchCommandsResponse_Response_RawDelete:
-		return &Response{Resp: res.RawDelete}
+		return &Response{Resp: res.RawDelete}, nil
 	case *tikvpb.BatchCommandsResponse_Response_RawBatchDelete:
-		return &Response{Resp: res.RawBatchDelete}
+		return &Response{Resp: res.RawBatchDelete}, nil
 	case *tikvpb.BatchCommandsResponse_Response_RawDeleteRange:
-		return &Response{Resp: res.RawDeleteRange}
+		return &Response{Resp: res.RawDeleteRange}, nil
 	case *tikvpb.BatchCommandsResponse_Response_RawScan:
-		return &Response{Resp: res.RawScan}
+		return &Response{Resp: res.RawScan}, nil
 	case *tikvpb.BatchCommandsResponse_Response_Coprocessor:
-		return &Response{Resp: res.Coprocessor}
+		return &Response{Resp: res.Coprocessor}, nil
 	case *tikvpb.BatchCommandsResponse_Response_PessimisticLock:
-		return &Response{Resp: res.PessimisticLock}
+		return &Response{Resp: res.PessimisticLock}, nil
 	case *tikvpb.BatchCommandsResponse_Response_PessimisticRollback:
-		return &Response{Resp: res.PessimisticRollback}
+		return &Response{Resp: res.PessimisticRollback}, nil
 	case *tikvpb.BatchCommandsResponse_Response_Empty:
-		return &Response{Resp: res.Empty}
+		return &Response{Resp: res.Empty}, nil
+	case *tikvpb.BatchCommandsResponse_Response_TxnHeartBeat:
+		return &Response{Resp: res.TxnHeartBeat}, nil
+	case *tikvpb.BatchCommandsResponse_Response_CheckTxnStatus:
+		return &Response{Resp: res.CheckTxnStatus}, nil
 	}
-	return nil
+	panic("unreachable")
 }
 
 // CopStreamResponse combinates tikvpb.Tikv_CoprocessorStreamClient and the first Recv() result together.
@@ -437,8 +498,10 @@ type CopStreamResponse struct {
 // SetContext set the Context field for the given req to the specified ctx.
 func SetContext(req *Request, region *metapb.Region, peer *metapb.Peer) error {
 	ctx := &req.Context
-	ctx.RegionId = region.Id
-	ctx.RegionEpoch = region.RegionEpoch
+	if region != nil {
+		ctx.RegionId = region.Id
+		ctx.RegionEpoch = region.RegionEpoch
+	}
 	ctx.Peer = peer
 
 	switch req.Type {
@@ -486,6 +549,14 @@ func SetContext(req *Request, region *metapb.Region, peer *metapb.Peer) error {
 		req.RawScan().Context = ctx
 	case CmdUnsafeDestroyRange:
 		req.UnsafeDestroyRange().Context = ctx
+	case CmdRegisterLockObserver:
+		req.RegisterLockObserver().Context = ctx
+	case CmdCheckLockObserver:
+		req.CheckLockObserver().Context = ctx
+	case CmdRemoveLockObserver:
+		req.RemoveLockObserver().Context = ctx
+	case CmdPhysicalScanLock:
+		req.PhysicalScanLock().Context = ctx
 	case CmdCop:
 		req.Cop().Context = ctx
 	case CmdCopStream:
@@ -498,6 +569,10 @@ func SetContext(req *Request, region *metapb.Region, peer *metapb.Peer) error {
 		req.SplitRegion().Context = ctx
 	case CmdEmpty:
 		req.SplitRegion().Context = ctx
+	case CmdTxnHeartBeat:
+		req.TxnHeartBeat().Context = ctx
+	case CmdCheckTxnStatus:
+		req.CheckTxnStatus().Context = ctx
 	default:
 		return fmt.Errorf("invalid request type %v", req.Type)
 	}
@@ -621,6 +696,14 @@ func GenRegionErrorResp(req *Request, e *errorpb.Error) (*Response, error) {
 			RegionError: e,
 		}
 	case CmdEmpty:
+	case CmdTxnHeartBeat:
+		p = &kvrpcpb.TxnHeartBeatResponse{
+			RegionError: e,
+		}
+	case CmdCheckTxnStatus:
+		p = &kvrpcpb.CheckTxnStatusResponse{
+			RegionError: e,
+		}
 	default:
 		return nil, fmt.Errorf("invalid request type %v", req.Type)
 	}
@@ -698,6 +781,14 @@ func CallRPC(ctx context.Context, client tikvpb.TikvClient, req *Request) (*Resp
 		resp.Resp, err = client.RawScan(ctx, req.RawScan())
 	case CmdUnsafeDestroyRange:
 		resp.Resp, err = client.UnsafeDestroyRange(ctx, req.UnsafeDestroyRange())
+	case CmdRegisterLockObserver:
+		resp.Resp, err = client.RegisterLockObserver(ctx, req.RegisterLockObserver())
+	case CmdCheckLockObserver:
+		resp.Resp, err = client.CheckLockObserver(ctx, req.CheckLockObserver())
+	case CmdRemoveLockObserver:
+		resp.Resp, err = client.RemoveLockObserver(ctx, req.RemoveLockObserver())
+	case CmdPhysicalScanLock:
+		resp.Resp, err = client.PhysicalScanLock(ctx, req.PhysicalScanLock())
 	case CmdCop:
 		resp.Resp, err = client.Coprocessor(ctx, req.Cop())
 	case CmdCopStream:
@@ -714,6 +805,10 @@ func CallRPC(ctx context.Context, client tikvpb.TikvClient, req *Request) (*Resp
 		resp.Resp, err = client.SplitRegion(ctx, req.SplitRegion())
 	case CmdEmpty:
 		resp.Resp, err = &tikvpb.BatchCommandsEmptyResponse{}, nil
+	case CmdCheckTxnStatus:
+		resp.Resp, err = client.KvCheckTxnStatus(ctx, req.CheckTxnStatus())
+	case CmdTxnHeartBeat:
+		resp.Resp, err = client.KvTxnHeartBeat(ctx, req.TxnHeartBeat())
 	default:
 		return nil, errors.Errorf("invalid request type: %v", req.Type)
 	}

@@ -32,12 +32,24 @@ const mismatchClusterID = "mismatch cluster id"
 
 // MySQL error instances.
 var (
-	ErrTiKVServerTimeout  = terror.ClassTiKV.New(mysql.ErrTiKVServerTimeout, mysql.MySQLErrName[mysql.ErrTiKVServerTimeout])
-	ErrResolveLockTimeout = terror.ClassTiKV.New(mysql.ErrResolveLockTimeout, mysql.MySQLErrName[mysql.ErrResolveLockTimeout])
-	ErrPDServerTimeout    = terror.ClassTiKV.New(mysql.ErrPDServerTimeout, mysql.MySQLErrName[mysql.ErrPDServerTimeout])
-	ErrRegionUnavailable  = terror.ClassTiKV.New(mysql.ErrRegionUnavailable, mysql.MySQLErrName[mysql.ErrRegionUnavailable])
-	ErrTiKVServerBusy     = terror.ClassTiKV.New(mysql.ErrTiKVServerBusy, mysql.MySQLErrName[mysql.ErrTiKVServerBusy])
-	ErrGCTooEarly         = terror.ClassTiKV.New(mysql.ErrGCTooEarly, mysql.MySQLErrName[mysql.ErrGCTooEarly])
+	ErrTiKVServerTimeout           = terror.ClassTiKV.New(mysql.ErrTiKVServerTimeout, mysql.MySQLErrName[mysql.ErrTiKVServerTimeout])
+	ErrResolveLockTimeout          = terror.ClassTiKV.New(mysql.ErrResolveLockTimeout, mysql.MySQLErrName[mysql.ErrResolveLockTimeout])
+	ErrPDServerTimeout             = terror.ClassTiKV.New(mysql.ErrPDServerTimeout, mysql.MySQLErrName[mysql.ErrPDServerTimeout])
+	ErrRegionUnavailable           = terror.ClassTiKV.New(mysql.ErrRegionUnavailable, mysql.MySQLErrName[mysql.ErrRegionUnavailable])
+	ErrTiKVServerBusy              = terror.ClassTiKV.New(mysql.ErrTiKVServerBusy, mysql.MySQLErrName[mysql.ErrTiKVServerBusy])
+	ErrGCTooEarly                  = terror.ClassTiKV.New(mysql.ErrGCTooEarly, mysql.MySQLErrName[mysql.ErrGCTooEarly])
+	ErrQueryInterrupted            = terror.ClassTiKV.New(mysql.ErrQueryInterrupted, mysql.MySQLErrName[mysql.ErrQueryInterrupted])
+	ErrLockAcquireFailAndNoWaitSet = terror.ClassTiKV.New(mysql.ErrLockAcquireFailAndNoWaitSet, mysql.MySQLErrName[mysql.ErrLockAcquireFailAndNoWaitSet])
+	ErrLockWaitTimeout             = terror.ClassTiKV.New(mysql.ErrLockWaitTimeout, mysql.MySQLErrName[mysql.ErrLockWaitTimeout])
+	ErrTokenLimit                  = terror.ClassTiKV.New(mysql.ErrTiKVStoreLimit, mysql.MySQLErrName[mysql.ErrTiKVStoreLimit])
+	ErrUnknown                     = terror.ClassTiKV.New(mysql.ErrUnknown, mysql.MySQLErrName[mysql.ErrUnknown])
+)
+
+// Registers error returned from TiKV.
+var (
+	_ = terror.ClassTiKV.NewStd(mysql.ErrDataOutOfRange)
+	_ = terror.ClassTiKV.NewStd(mysql.ErrTruncatedWrongValue)
+	_ = terror.ClassTiKV.NewStd(mysql.ErrDivisionByZero)
 )
 
 // ErrDeadlock wraps *kvrpcpb.Deadlock to implement the error interface.
@@ -49,17 +61,4 @@ type ErrDeadlock struct {
 
 func (d *ErrDeadlock) Error() string {
 	return d.Deadlock.String()
-}
-
-func init() {
-	tikvMySQLErrCodes := map[terror.ErrCode]uint16{
-		mysql.ErrTiKVServerTimeout:   mysql.ErrTiKVServerTimeout,
-		mysql.ErrResolveLockTimeout:  mysql.ErrResolveLockTimeout,
-		mysql.ErrPDServerTimeout:     mysql.ErrPDServerTimeout,
-		mysql.ErrRegionUnavailable:   mysql.ErrRegionUnavailable,
-		mysql.ErrTiKVServerBusy:      mysql.ErrTiKVServerBusy,
-		mysql.ErrGCTooEarly:          mysql.ErrGCTooEarly,
-		mysql.ErrTruncatedWrongValue: mysql.ErrTruncatedWrongValue,
-	}
-	terror.ErrClassToMySQLCodes[terror.ClassTiKV] = tikvMySQLErrCodes
 }

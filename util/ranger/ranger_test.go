@@ -34,6 +34,7 @@ import (
 	"github.com/pingcap/tidb/util/ranger"
 	"github.com/pingcap/tidb/util/testkit"
 	"github.com/pingcap/tidb/util/testleak"
+	"github.com/pingcap/tidb/util/testutil"
 )
 
 func TestT(t *testing.T) {
@@ -44,10 +45,18 @@ var _ = Suite(&testRangerSuite{})
 
 type testRangerSuite struct {
 	*parser.Parser
+	testData testutil.TestData
 }
 
 func (s *testRangerSuite) SetUpSuite(c *C) {
 	s.Parser = parser.New()
+	var err error
+	s.testData, err = testutil.LoadTestSuiteData("testdata", "ranger_suite")
+	c.Assert(err, IsNil)
+}
+
+func (s *testRangerSuite) TearDownSuite(c *C) {
+	c.Assert(s.testData.GenerateOutputIfNeeded(), IsNil)
 }
 
 func newDomainStoreWithBootstrap(c *C) (*domain.Domain, kv.Storage, error) {
@@ -303,12 +312,12 @@ func (s *testRangerSuite) TestTableRange(c *C) {
 		is := domain.GetDomain(sctx).InfoSchema()
 		err = plannercore.Preprocess(sctx, stmts[0], is)
 		c.Assert(err, IsNil, Commentf("error %v, for resolve name, expr %s", err, tt.exprStr))
-		p, err := plannercore.BuildLogicalPlan(ctx, sctx, stmts[0], is)
+		p, _, err := plannercore.BuildLogicalPlan(ctx, sctx, stmts[0], is)
 		c.Assert(err, IsNil, Commentf("error %v, for build plan, expr %s", err, tt.exprStr))
 		selection := p.(plannercore.LogicalPlan).Children()[0].(*plannercore.LogicalSelection)
-		conds := make([]expression.Expression, 0, len(selection.Conditions))
-		for _, cond := range selection.Conditions {
-			conds = append(conds, expression.PushDownNot(sctx, cond, false))
+		conds := make([]expression.Expression, len(selection.Conditions))
+		for i, cond := range selection.Conditions {
+			conds[i] = expression.PushDownNot(sctx, cond)
 		}
 		tbl := selection.Children()[0].(*plannercore.DataSource).TableInfo()
 		col := expression.ColInfo2Col(selection.Schema().Columns, tbl.Columns[0])
@@ -587,16 +596,16 @@ func (s *testRangerSuite) TestIndexRange(c *C) {
 		is := domain.GetDomain(sctx).InfoSchema()
 		err = plannercore.Preprocess(sctx, stmts[0], is)
 		c.Assert(err, IsNil, Commentf("error %v, for resolve name, expr %s", err, tt.exprStr))
-		p, err := plannercore.BuildLogicalPlan(ctx, sctx, stmts[0], is)
+		p, _, err := plannercore.BuildLogicalPlan(ctx, sctx, stmts[0], is)
 		c.Assert(err, IsNil, Commentf("error %v, for build plan, expr %s", err, tt.exprStr))
 		selection := p.(plannercore.LogicalPlan).Children()[0].(*plannercore.LogicalSelection)
 		tbl := selection.Children()[0].(*plannercore.DataSource).TableInfo()
 		c.Assert(selection, NotNil, Commentf("expr:%v", tt.exprStr))
-		conds := make([]expression.Expression, 0, len(selection.Conditions))
-		for _, cond := range selection.Conditions {
-			conds = append(conds, expression.PushDownNot(sctx, cond, false))
+		conds := make([]expression.Expression, len(selection.Conditions))
+		for i, cond := range selection.Conditions {
+			conds[i] = expression.PushDownNot(sctx, cond)
 		}
-		cols, lengths := expression.IndexInfo2Cols(selection.Schema().Columns, tbl.Indices[tt.indexPos])
+		cols, lengths := expression.IndexInfo2PrefixCols(tbl.Columns, selection.Schema().Columns, tbl.Indices[tt.indexPos])
 		c.Assert(cols, NotNil)
 		res, err := ranger.DetachCondAndBuildRangeForIndex(sctx, conds, cols, lengths)
 		c.Assert(err, IsNil)
@@ -708,16 +717,16 @@ func (s *testRangerSuite) TestIndexRangeForUnsignedInt(c *C) {
 		is := domain.GetDomain(sctx).InfoSchema()
 		err = plannercore.Preprocess(sctx, stmts[0], is)
 		c.Assert(err, IsNil, Commentf("error %v, for resolve name, expr %s", err, tt.exprStr))
-		p, err := plannercore.BuildLogicalPlan(ctx, sctx, stmts[0], is)
+		p, _, err := plannercore.BuildLogicalPlan(ctx, sctx, stmts[0], is)
 		c.Assert(err, IsNil, Commentf("error %v, for build plan, expr %s", err, tt.exprStr))
 		selection := p.(plannercore.LogicalPlan).Children()[0].(*plannercore.LogicalSelection)
 		tbl := selection.Children()[0].(*plannercore.DataSource).TableInfo()
 		c.Assert(selection, NotNil, Commentf("expr:%v", tt.exprStr))
-		conds := make([]expression.Expression, 0, len(selection.Conditions))
-		for _, cond := range selection.Conditions {
-			conds = append(conds, expression.PushDownNot(sctx, cond, false))
+		conds := make([]expression.Expression, len(selection.Conditions))
+		for i, cond := range selection.Conditions {
+			conds[i] = expression.PushDownNot(sctx, cond)
 		}
-		cols, lengths := expression.IndexInfo2Cols(selection.Schema().Columns, tbl.Indices[tt.indexPos])
+		cols, lengths := expression.IndexInfo2PrefixCols(tbl.Columns, selection.Schema().Columns, tbl.Indices[tt.indexPos])
 		c.Assert(cols, NotNil)
 		res, err := ranger.DetachCondAndBuildRangeForIndex(sctx, conds, cols, lengths)
 		c.Assert(err, IsNil)
@@ -1039,14 +1048,14 @@ func (s *testRangerSuite) TestColumnRange(c *C) {
 		is := domain.GetDomain(sctx).InfoSchema()
 		err = plannercore.Preprocess(sctx, stmts[0], is)
 		c.Assert(err, IsNil, Commentf("error %v, for resolve name, expr %s", err, tt.exprStr))
-		p, err := plannercore.BuildLogicalPlan(ctx, sctx, stmts[0], is)
+		p, _, err := plannercore.BuildLogicalPlan(ctx, sctx, stmts[0], is)
 		c.Assert(err, IsNil, Commentf("error %v, for build plan, expr %s", err, tt.exprStr))
 		sel := p.(plannercore.LogicalPlan).Children()[0].(*plannercore.LogicalSelection)
 		ds, ok := sel.Children()[0].(*plannercore.DataSource)
 		c.Assert(ok, IsTrue, Commentf("expr:%v", tt.exprStr))
-		conds := make([]expression.Expression, 0, len(sel.Conditions))
-		for _, cond := range sel.Conditions {
-			conds = append(conds, expression.PushDownNot(sctx, cond, false))
+		conds := make([]expression.Expression, len(sel.Conditions))
+		for i, cond := range sel.Conditions {
+			conds[i] = expression.PushDownNot(sctx, cond)
 		}
 		col := expression.ColInfo2Col(sel.Schema().Columns, ds.TableInfo().Columns[tt.colPos])
 		c.Assert(col, NotNil)
@@ -1075,10 +1084,10 @@ func (s *testRangerSuite) TestIndexRangeElimininatedProjection(c *C) {
 	testKit.MustExec("analyze table t")
 	testKit.MustQuery("explain select * from (select * from t union all select ifnull(a,b), b from t) sub where a > 0").Check(testkit.Rows(
 		"Union_11 2.00 root ",
-		"├─IndexReader_14 1.00 root index:IndexScan_13",
-		"│ └─IndexScan_13 1.00 cop table:t, index:a, b, range:(0,+inf], keep order:false",
-		"└─IndexReader_17 1.00 root index:IndexScan_16",
-		"  └─IndexScan_16 1.00 cop table:t, index:a, b, range:(0,+inf], keep order:false",
+		"├─IndexReader_14 1.00 root index:IndexRangeScan_13",
+		"│ └─IndexRangeScan_13 1.00 cop[tikv] table:t, index:a, b, range:(0,+inf], keep order:false",
+		"└─IndexReader_17 1.00 root index:IndexRangeScan_16",
+		"  └─IndexRangeScan_16 1.00 cop[tikv] table:t, index:a, b, range:(0,+inf], keep order:false",
 	))
 	testKit.MustQuery("select * from (select * from t union all select ifnull(a,b), b from t) sub where a > 0").Check(testkit.Rows(
 		"1 2",
@@ -1100,20 +1109,18 @@ func (s *testRangerSuite) TestCompIndexInExprCorrCol(c *C) {
 	testKit.MustExec("create table t(a int primary key, b int, c int, d int, e int, index idx(b,c,d))")
 	testKit.MustExec("insert into t values(1,1,1,1,2),(2,1,2,1,0)")
 	testKit.MustExec("analyze table t")
-	testKit.MustQuery("explain select t.e in (select count(*) from t s use index(idx), t t1 where s.b = 1 and s.c in (1, 2) and s.d = t.a and s.a = t1.a) from t").Check(testkit.Rows(
-		"Projection_11 2.00 root 9_aux_0",
-		"└─Apply_13 2.00 root CARTESIAN left outer semi join, inner:StreamAgg_20, other cond:eq(test.t.e, 7_col_0)",
-		"  ├─TableReader_15 2.00 root data:TableScan_14",
-		"  │ └─TableScan_14 2.00 cop table:t, range:[-inf,+inf], keep order:false",
-		"  └─StreamAgg_20 1.00 root funcs:count(1)",
-		"    └─IndexJoin_32 2.00 root inner join, inner:TableReader_31, outer key:test.s.a, inner key:test.t1.a",
-		"      ├─IndexReader_27 2.00 root index:IndexScan_26",
-		"      │ └─IndexScan_26 2.00 cop table:s, index:b, c, d, range: decided by [eq(test.s.b, 1) in(test.s.c, 1, 2) eq(test.s.d, test.t.a)], keep order:false",
-		"      └─TableReader_31 1.00 root data:TableScan_30",
-		"        └─TableScan_30 1.00 cop table:t1, range: decided by [test.s.a], keep order:false",
-	))
-	testKit.MustQuery("select t.e in (select count(*) from t s use index(idx), t t1 where s.b = 1 and s.c in (1, 2) and s.d = t.a and s.a = t1.a) from t").Check(testkit.Rows(
-		"1",
-		"1",
-	))
+
+	var input []string
+	var output []struct {
+		SQL    string
+		Result []string
+	}
+	s.testData.GetTestCases(c, &input, &output)
+	for i, tt := range input {
+		s.testData.OnRecord(func() {
+			output[i].SQL = tt
+			output[i].Result = s.testData.ConvertRowsToStrings(testKit.MustQuery(tt).Rows())
+		})
+		testKit.MustQuery(tt).Check(testkit.Rows(output[i].Result...))
+	}
 }
